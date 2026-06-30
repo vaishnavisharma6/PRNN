@@ -1,374 +1,357 @@
+# =========================================================
+# APTOS 2019 - Phase 6.16
+# Transfer Learning & Freezing
+# Full Kaggle-compatible code
+# =========================================================
+
+import os
+import copy
+import random
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+from PIL import Image
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import pandas as pd
-import os
-from sklearn.metrics import precision_recall_curve, average_precision_score
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models, transforms
 
-# read data from kaggle
-df = pd.read_csv('/Users/vaishnavisharma/prnn/delhi_aqi.csv')
+# -----------------------------
+# 1. Reproducibility
+# -----------------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-df = df.drop(columns=['date'])
-features = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
+set_seed(42)
 
-epochs = 1300
-data = df[features].values
-print(data)
+# -----------------------------
+# 2. Device
+# -----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
-# create past 72 hours data and t+24 pm2.5 labels
-X = []
-Y = []
-Y_class = []
+# -----------------------------
+# 3. Kaggle paths
+# -----------------------------
+CSV_PATH = "/kaggle/input/competitions/aptos2019-blindness-detection/train.csv"
+IMAGE_DIR = "/kaggle/input/competitions/aptos2019-blindness-detection/train_images"
 
-past = 72
-future = 24
+# -----------------------------
+# 4. Load CSV
+# -----------------------------
+df = pd.read_csv(CSV_PATH)
 
-for t in range(past, len(data) - future):
-    X.append(data[t-past:t])
-    Y.append(data[t+future][5])
-    Y_class.append(1 if data[t+future][5] > 200 else 0)
+print("Dataset shape:", df.shape)
+print(df.head())
+print("\nClass distribution:")
+print(df["diagnosis"].value_counts().sort_index())
 
-X = np.array(X)
-Y = np.array(Y)
-Y_class = np.array(Y_class)
+# -----------------------------
+# 5. Stratified train/val split
+# -----------------------------
+train_df, val_df = train_test_split(
+    df,
+    test_size=0.2,
+    stratify=df["diagnosis"],
+    random_state=42
+)
 
-N = X.shape[0]
-train = int(0.7 * N)
-val = int(0.85 * N)
+train_df = train_df.reset_index(drop=True)
+val_df = val_df.reset_index(drop=True)
 
-X_train = X[:train]
-X_val = X[train:val]
-X_test = X[val:]
+print("\nTrain size:", len(train_df))
+print("Val size  :", len(val_df))
 
-Y_train = Y[:train]
-Y_val = Y[train:val]
-Y_test = Y[val:]
+print("\nTrain class counts:")
+print(train_df["diagnosis"].value_counts().sort_index())
 
-c_train = Y_class[:train]
-c_val = Y_class[train:val]
-c_test = Y_class[val:]
+print("\nVal class counts:")
+print(val_df["diagnosis"].value_counts().sort_index())
 
-X_train = X_train.reshape(X_train.shape[0], -1)
-X_val = X_val.reshape(X_val.shape[0], -1)
-X_test = X_test.reshape(X_test.shape[0], -1)
+# -----------------------------
+# 6. Dataset
+# -----------------------------
+class APTOSDataset(Dataset):
+    def __init__(self, dataframe, image_dir, transform=None):
+        self.dataframe = dataframe
+        self.image_dir = image_dir
+        self.transform = transform
 
-X_train = torch.tensor(X_train, dtype=torch.float32)
-X_val = torch.tensor(X_val, dtype=torch.float32)
-X_test = torch.tensor(X_test, dtype=torch.float32)
+    def __len__(self):
+        return len(self.dataframe)
 
-Y_train = torch.tensor(Y_train, dtype=torch.float32).view(-1, 1)
-Y_val = torch.tensor(Y_val, dtype=torch.float32).view(-1, 1)
-Y_test = torch.tensor(Y_test, dtype=torch.float32).view(-1, 1)
+    def __getitem__(self, idx):
+        row = self.dataframe.iloc[idx]
+        image_id = row["id_code"]
+        label = int(row["diagnosis"])
 
-c_train = torch.tensor(c_train, dtype=torch.float32).view(-1, 1)
-c_val = torch.tensor(c_val, dtype=torch.float32).view(-1, 1)
-c_test = torch.tensor(c_test, dtype=torch.float32).view(-1, 1)
+        image_path = os.path.join(self.image_dir, image_id + ".png")
+        image = Image.open(image_path).convert("RGB")
 
-# architecture
-class MLP(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
+        if self.transform is not None:
+            image = self.transform(image)
 
-    def forward(self, x):
-        return self.net(x)
+        return image, label
 
-train_losses = []
-val_losses = []
+# -----------------------------
+# 7. Transforms
+# ResNet18 expects ImageNet normalization
+# -----------------------------
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
 
-model = MLP(input_dim=576)
-optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
-criterion = torch.nn.MSELoss()
+val_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
 
-# train model
-for epoch in range(300):
+# -----------------------------
+# 8. Datasets and loaders
+# -----------------------------
+train_dataset = APTOSDataset(train_df, IMAGE_DIR, transform=train_transform)
+val_dataset = APTOSDataset(val_df, IMAGE_DIR, transform=val_transform)
+
+BATCH_SIZE = 32
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=torch.cuda.is_available()
+)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=torch.cuda.is_available()
+)
+
+# -----------------------------
+# 9. Load pretrained ResNet18
+# -----------------------------
+weights = models.ResNet18_Weights.DEFAULT
+model = models.resnet18(weights=weights)
+
+# Freeze all existing parameters
+for param in model.parameters():
+    param.requires_grad = False
+
+# Replace final fully connected layer for 5 classes
+in_features = model.fc.in_features
+model.fc = nn.Linear(in_features, 5)
+model = model.to(device)
+
+# -----------------------------
+# 10. Count trainable/frozen parameters
+# -----------------------------
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+total_params = trainable_params + frozen_params
+
+print("\nParameter counts:")
+print("Trainable parameters:", trainable_params)
+print("Frozen parameters   :", frozen_params)
+print("Total parameters    :", total_params)
+
+# Optional: print exact trainable layer names
+print("\nTrainable layers:")
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(name, param.shape)
+
+# -----------------------------
+# 11. Loss and optimizer
+# Only train the new head
+# -----------------------------
+criterion = nn.CrossEntropyLoss()
+
+optimizer = torch.optim.Adam(
+    filter(lambda p: p.requires_grad, model.parameters()),
+    lr=1e-3
+)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="min",
+    factor=0.5,
+    patience=2
+)
+
+# ----------------# 12. Train function
+# -----------------------------
+def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
-    preds = model(X_train)
-    loss = criterion(preds, Y_train)
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
 
-    # validation
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+        preds = outputs.argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().numpy())
+        all_labels.extend(labels.detach().cpu().numpy())
+
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = accuracy_score(all_labels, all_preds)
+
+    return epoch_loss, epoch_acc
+
+# -----------------------------
+# 13. Validation function
+# -----------------------------
+def validate_one_epoch(model, loader, criterion, device):
     model.eval()
+
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
     with torch.no_grad():
-        val_preds = model(X_val)
-        val_loss = criterion(val_preds, Y_val)
+        for images, labels in loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-    train_losses.append(loss.item())
-    val_losses.append(val_loss.item())
+            outputs = model(images)
+            loss = criterion(outputs, labels)
 
-model.eval()
-with torch.no_grad():
-    test_preds = model(X_test)
-    test_loss = criterion(test_preds, Y_test)
+            running_loss += loss.item() * images.size(0)
 
-print("Part 1.1 Test MSE:", test_loss.item())
-print("Part 1.1 Test RMSE:", torch.sqrt(test_loss).item())
+            preds = outputs.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
-plt.figure(figsize=(10, 6))
-plt.plot(train_losses, label='Train Loss')
-plt.plot(val_losses, label='Validation Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('Learning Curve')
-plt.legend()
-plt.savefig('loss.jpeg')
-plt.show()
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = accuracy_score(all_labels, all_preds)
 
+    return epoch_loss, epoch_acc
 
-# re-initialization with sigmoid
-class mlpsig(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, 256)
-        self.a1 = nn.Sigmoid()
-        self.fc2 = nn.Linear(256, 128)
-        self.a2 = nn.Sigmoid()
-        self.fc3 = nn.Linear(128, 1)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.a1(x)
-        x = self.fc2(x)
-        x = self.a2(x)
-        x = self.fc3(x)
-        return x
-
-model = mlpsig(input_dim=576)
+# -----------------------------
+# 14. Training loop
+# -----------------------------
+NUM_EPOCHS = 10
 
 train_losses = []
 val_losses = []
+train_accs = []
+val_accs = []
 
-optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
-criterion = torch.nn.MSELoss()
+best_val_loss = float("inf")
+best_model_state = copy.deepcopy(model.state_dict())
 
-# store gradient norms
-grad_fc1 = []
-grad_fc2 = []
-grad_fc3 = []
+for epoch in range(NUM_EPOCHS):
+    train_loss, train_acc = train_one_epoch(
+        model, train_loader, criterion, optimizer, device
+    )
+    val_loss, val_acc = validate_one_epoch(
+        model, val_loader, criterion, device
+    )
 
-def hook_fc1(grad):
-    grad_fc1.append(grad.norm(2).item())
+    scheduler.step(val_loss)
 
-def hook_fc2(grad):
-    grad_fc2.append(grad.norm(2).item())
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    train_accs.append(train_acc)
+    val_accs.append(val_acc)
 
-def hook_fc3(grad):
-    grad_fc3.append(grad.norm(2).item())
+    print(f"\nEpoch [{epoch+1}/{NUM_EPOCHS}]")
+    print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+    print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f}")
 
-h1 = model.fc1.weight.register_hook(hook_fc1)
-h2 = model.fc2.weight.register_hook(hook_fc2)
-h3 = model.fc3.weight.register_hook(hook_fc3)
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model_state = copy.deepcopy(model.state_dict())
 
-for epoch in range(300):
-    model.train()
-    preds = model(X_train)
-    loss = criterion(preds, Y_train)
+# Load best model
+model.load_state_dict(best_model_state)
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+print("\nBest Validation Loss:", best_val_loss)
 
-    # validation
-    model.eval()
-    with torch.no_grad():
-        val_preds = model(X_val)
-        val_loss = criterion(val_preds, Y_val)
+# -----------------------------
+# 15. Final validation evaluation
+# -----------------------------
+final_val_loss, final_val_acc = validate_one_epoch(
+    model, val_loader, criterion, device
+)
 
-    train_losses.append(loss.item())
-    val_losses.append(val_loss.item())
+print("\nFinal Best Model Metrics on Validation Set")
+print(f"Validation Loss: {final_val_loss:.4f}")
+print(f"Validation Acc : {final_val_acc:.4f}")
 
-h1.remove()
-h2.remove()
-h3.remove()
-
-model.eval()
-with torch.no_grad():
-    test_preds = model(X_test)
-    test_loss = criterion(test_preds, Y_test)
-
-print("Part 1.2 Test MSE:", test_loss.item())
-print("Part 1.2 Test RMSE:", torch.sqrt(test_loss).item())
-
-plt.figure(figsize=(10, 6))
-plt.plot(train_losses, label='Train Loss')
-plt.plot(val_losses, label='Validation Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('Learning Curve with Sigmoid')
-plt.legend()
-plt.savefig('loss_sig.jpeg')
+# -----------------------------
+# 16. Plot validation loss curve
+# This is required by the question
+# -----------------------------
+plt.figure(figsize=(8, 5))
+plt.plot(range(1, NUM_EPOCHS + 1), val_losses, marker="o")
+plt.xlabel("Epoch")
+plt.ylabel("Validation Loss")
+plt.title("Validation Loss Curve")
+plt.grid(True)
 plt.show()
 
-plt.figure(figsize=(10, 6))
-plt.plot(grad_fc1, label='First Linear Layer')
-plt.plot(grad_fc2, label='Second Linear Layer')
-plt.plot(grad_fc3, label='Third Linear Layer')
-plt.xlabel('Backward step')
-plt.ylabel('L2 norm of gradient')
-plt.title('Gradient Flow in Sigmoid MLP')
-plt.legend()
-plt.savefig('gradient_flow_sigmoid.jpeg')
-plt.show()
-
-
-# part 1.3
-class cmlp(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-train_losses = []
-val_losses = []
-
-model = cmlp(input_dim=576)
-optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
-criterion = nn.BCELoss()
-
-for epoch in range(300):
-    model.train()
-    preds = model(X_train)
-    loss = criterion(preds, c_train)
-
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    # validation
-    model.eval()
-    with torch.no_grad():
-        val_preds = model(X_val)
-        val_loss = criterion(val_preds, c_val)
-
-    train_losses.append(loss.item())
-    val_losses.append(val_loss.item())
-
-model.eval()
-with torch.no_grad():
-    test_preds = model(X_test)
-    test_loss = criterion(test_preds, c_test)
-
-print("BCELoss Test Loss:", test_loss.item())
-
-plt.figure(figsize=(10, 6))
-plt.plot(train_losses, label='Train Loss')
-plt.plot(val_losses, label='Validation Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('BCELoss Learning Curve')
-plt.legend()
-plt.savefig('loss_bce.jpeg')
-plt.show()
-
-with torch.no_grad():
-    test_probs_bce = model(X_test).cpu().numpy().ravel()
-
-
-class cmlp_logits(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-train_losses = []
-val_losses = []
-
-num_pos = c_train.sum().item()
-num_neg = len(c_train) - num_pos
-pos_weight_value = num_neg / num_pos
-pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32)
-
-print("Positive samples:", num_pos)
-print("Negative samples:", num_neg)
-print("pos_weight:", pos_weight.item())
-
-model_logits = cmlp_logits(input_dim=576)
-optimizer = torch.optim.Adam(model_logits.parameters(), lr=5e-4)
-criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-for epoch in range(300):
-    model_logits.train()
-    logits = model_logits(X_train)
-    loss = criterion(logits, c_train)
-
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    # validation
-    model_logits.eval()
-    with torch.no_grad():
-        val_logits = model_logits(X_val)
-        val_loss = criterion(val_logits, c_val)
-
-    train_losses.append(loss.item())
-    val_losses.append(val_loss.item())
-
-model_logits.eval()
-with torch.no_grad():
-    test_logits = model_logits(X_test)
-    test_loss = criterion(test_logits, c_test)
-    test_probs_logits = torch.sigmoid(test_logits).cpu().numpy().ravel()
-
-print("BCEWithLogitsLoss Test Loss:", test_loss.item())
-
-plt.figure(figsize=(10, 6))
-plt.plot(train_losses, label='Train Loss')
-plt.plot(val_losses, label='Validation Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('BCEWithLogitsLoss Learning Curve')
-plt.legend()
-plt.savefig('loss_bce_logits.jpeg')
-plt.show()
-
-# Precision-Recall curves
-y_true = c_test.cpu().numpy().ravel()
-
-precision_bce, recall_bce, _ = precision_recall_curve(y_true, test_probs_bce)
-precision_logits, recall_logits, _ = precision_recall_curve(y_true, test_probs_logits)
-
-ap_bce = average_precision_score(y_true, test_probs_bce)
-ap_logits = average_precision_score(y_true, test_probs_logits)
-
-print("Average Precision for BCELoss model:", ap_bce)
-print("Average Precision for BCEWithLogitsLoss model:", ap_logits)
-
-plt.figure(figsize=(10, 6))
-plt.plot(recall_bce, precision_bce, label=f'BCELoss (AP = {ap_bce:.4f})')
-plt.plot(recall_logits, precision_logits, label=f'BCEWithLogitsLoss + pos_weight (AP = {ap_logits:.4f})')
-plt.xlabel('Recall')
-plt.ylabel('Precision')
-plt.title('Precision-Recall Curve Comparison')
+# -----------------------------
+# 17. Optional: plot train/val loss together
+# -----------------------------
+plt.figure(figsize=(8, 5))
+plt.plot(range(1, NUM_EPOCHS + 1), train_losses, marker="o", label="Train Loss")
+plt.plot(range(1, NUM_EPOCHS + 1), val_losses, marker="s", label="Val Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Train vs Validation Loss")
 plt.legend()
 plt.grid(True)
-plt.savefig('pr_curve.jpeg')
 plt.show()
+
+# -----------------------------
+# 18. Optional: plot train/val accuracy
+# -----------------------------
+plt.figure(figsize=(8, 5))
+plt.plot(range(1, NUM_EPOCHS + 1), train_accs, marker="o", label="Train Accuracy")
+plt.plot(range(1, NUM_EPOCHS + 1), val_accs, marker="s", label="Val Accuracy")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.title("Train vs Validation Accuracy")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# -----------------------------
+# 19. Save best model
+# -----------------------------
+SAVE_PATH = "/kaggle/working/aptos_resnet18_frozen_head_best.pth"
+torch.save(model.state_dict(), SAVE_PATH)
+print("\nBest model saved to:", SAVE_PATH)
