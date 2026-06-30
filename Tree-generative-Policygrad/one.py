@@ -1,271 +1,64 @@
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
+import pandas as pd
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.distributions import Bernoulli
-from sklearn.preprocessing import StandardScaler
 
 
+df = pd.read_csv('/Users/vaishnavisharma/prnn-3/delhi_aqi.csv')
+Y = np.where(df['pm2_5'] > 200, 1, 0)
 
-# 1. Load data
-csv_path = "/Users/vaishnavisharma/prnn-3/delhi_aqi.csv" 
+def gini_impurity(Y):
+    if len(Y) == 0:
+        return 0
+    
+    p1 = np.mean(Y)
+    p0 = 1 - p1
 
-df = pd.read_csv(csv_path)
+    return(1- (p0**2 + p1**2))
 
-# Drop date/time columns if present
-for col in df.columns:
-    if "date" in col.lower() or "time" in col.lower():
-        df = df.drop(columns=[col])
 
-# Convert all columns to numeric
-df = df.apply(pd.to_numeric, errors="coerce")
+def gini_gain(parent, left, right):
+    n = len(parent)
 
-# Fill missing values
-df = df.fillna(method="ffill").fillna(method="bfill")
+    g_parent = gini_impurity(parent)
+    g_left = gini_impurity(left)
+    g_right = gini_impurity(right)
 
-print("Columns:", df.columns.tolist())
+    weighted = (len(left)/n) * g_left + (len(right)/n)* g_right
 
+    reduction = g_parent - weighted
 
+    return reduction
 
-# 2. Choose PM2.5 column
+def best(X, Y):
+    sorted_idx = np.argsort(X)
+    X_sorted = X[sorted_idx]
+    Y_sorted = Y[sorted_idx]
 
-pm25_col = None
-for col in df.columns:
-    if "pm2_5" in col.lower():
-        pm25_col = col
-        break
 
-if pm25_col is None:
-    raise ValueError("No PM2.5 column found. Please rename your PM2.5 column or set pm25_col manually.")
+    best_gain = -np.inf
+    best_threshold = None
 
-print("Using PM2.5 column:", pm25_col)
+    for i in range(1, len(X_sorted)):
+        if X_sorted[i] == X_sorted[i-1]:
+            continue
 
+        threshold = (X_sorted[i]+X_sorted[i-1])/2
+        left = X_sorted <= threshold
+        right = X_sorted > threshold
 
+        left_Y = Y_sorted[left]
+        right_Y = Y_sorted[right]
 
-# 3. Normalize features
-features = df.values.astype(np.float32)
+        gain = gini_gain(Y_sorted, left_Y, right_Y)
 
-scaler = StandardScaler()
-features_scaled = scaler.fit_transform(features).astype(np.float32)
+        if gain > best_gain:
+            best_gain = gain
+            best_threshold = threshold
+    return(best_threshold, best_gain)        
 
-pm25_values = df[pm25_col].values.astype(np.float32)
 
-
-
-# 4. Create RL environment
-class AirQualityEnv:
-    def __init__(self, features_scaled, pm25_values, window_size=24, episode_length=200):
-        self.features_scaled = features_scaled
-        self.pm25_values = pm25_values
-        self.window_size = window_size
-        self.episode_length = episode_length
-
-        self.num_steps = len(features_scaled)
-        self.num_features = features_scaled.shape[1]
-        self.state_dim = window_size * self.num_features
-
-        self.t = None
-        self.steps_taken = None
-        self.start_index = None
-
-    def reset(self):
-        max_start = self.num_steps - self.episode_length - 2
-
-        if max_start <= self.window_size:
-            raise ValueError("Dataset is too small for the chosen window_size and episode_length.")
-
-        self.start_index = np.random.randint(self.window_size, max_start)
-        self.t = self.start_index
-        self.steps_taken = 0
-
-        return self._get_state()
-
-    def _get_state(self):
-        past_window = self.features_scaled[self.t - self.window_size:self.t]
-        return past_window.flatten()
-
-    def step(self, action):
-        next_pm25 = self.pm25_values[self.t + 1]
-
-        if action == 1:
-            reward = -0.1
-        elif action == 0 and next_pm25 > 150:
-            reward = -10.0
-        else:
-            reward = 0.0
-
-        self.t += 1
-        self.steps_taken += 1
-
-        done = self.steps_taken >= self.episode_length
-
-        next_state = self._get_state()
-
-        return next_state, reward, done
-
-
-
-# 5. Policy network
-
-
-class PolicyNetwork(nn.Module):
-    def __init__(self, state_dim):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, state):
-        return self.net(state)
-
-
-# =========================
-# 6. Compute discounted returns
-
-
-def compute_returns(rewards, gamma=0.99):
-    returns = []
-    G = 0
-
-    for r in reversed(rewards):
-        G = r + gamma * G
-        returns.insert(0, G)
-
-    returns = torch.tensor(returns, dtype=torch.float32)
-
-    if len(returns) > 1:
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-
-    return returns
-
-
-# =========================
-# 7. Train using REINFORCE
-
-
-env = AirQualityEnv(
-    features_scaled=features_scaled,
-    pm25_values=pm25_values,
-    window_size=24,
-    episode_length=200
-)
-
-policy = PolicyNetwork(env.state_dim)
-
-optimizer = optim.Adam(policy.parameters(), lr=1e-3)
-
-num_episodes = 500
-gamma = 0.99
-
-episode_returns = []
-
-for episode in range(num_episodes):
-    state = env.reset()
-
-    log_probs = []
-    rewards = []
-
-    done = False
-
-    while not done:
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-
-        prob_on = policy(state_tensor)
-        dist = Bernoulli(prob_on)
-
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-
-        action_int = int(action.item())
-
-        next_state, reward, done = env.step(action_int)
-
-        log_probs.append(log_prob.squeeze())
-        rewards.append(reward)
-
-        state = next_state
-
-    total_return = sum(rewards)
-    episode_returns.append(total_return)
-
-    returns = compute_returns(rewards, gamma)
-
-    loss = 0
-    for log_prob, G in zip(log_probs, returns):
-        loss += -log_prob * G
-
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    if (episode + 1) % 50 == 0:
-        avg_return = np.mean(episode_returns[-50:])
-        print(f"Episode {episode + 1}/{num_episodes}, Average Return: {avg_return:.2f}")
-
-
-# =========================
-# 8. Plot episodic return
-
-
-plt.figure(figsize=(10, 5))
-plt.plot(episode_returns)
-plt.xlabel("Episode")
-plt.ylabel("Total Episodic Return")
-plt.title("REINFORCE on Air Quality Purifier Control")
-plt.grid(True)
-plt.savefig('return.jpeg')
-
-
-# =========================
-# 9. Smooth plot
-
-
-window = 20
-smooth_returns = pd.Series(episode_returns).rolling(window).mean()
-
-plt.figure(figsize=(10, 5))
-plt.plot(smooth_returns)
-plt.xlabel("Episode")
-plt.ylabel("Smoothed Total Return")
-plt.title("Smoothed Episodic Return over 500 Episodes")
-plt.grid(True)
-plt.savefig('smooth.jpeg')
-
-
-# =========================
-# 10. Test trained policy
-
-
-state = env.reset()
-done = False
-
-test_rewards = []
-actions_taken = []
-
-while not done:
-    state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-
-    with torch.no_grad():
-        prob_on = policy(state_tensor)
-
-    action = 1 if prob_on.item() >= 0.5 else 0
-
-    next_state, reward, done = env.step(action)
-
-    test_rewards.append(reward)
-    actions_taken.append(action)
-
-    state = next_state
-
-print("\nTest total return:", sum(test_rewards))
-print("Number of times purifier ON:", sum(actions_taken))
-print("Number of times purifier OFF:", len(actions_taken) - sum(actions_taken))
+X = df['co'].values # iteration over co values
+threshold, gain = best(X, Y)
+print('best threshold:', threshold)
+print('best gain:', gain)
