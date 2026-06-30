@@ -1,346 +1,388 @@
-import math
+# ============================================================
+# PHASE 4.10 — LSTM Gradient Rescue
+# Assignment-correct script
+#
+# What this script does:
+# 1. Loads Delhi air-quality data
+# 2. Uses a chronological 70/15/15 split
+# 3. Standardizes using TRAIN statistics only
+# 4. Creates 100-step sequences
+# 5. Builds:
+#       - Vanilla RNN from scratch
+#       - LSTM using nn.LSTMCell unrolled manually
+# 6. Uses UNTRAINED models
+# 7. Computes loss and calls backward()
+# 8. Extracts gradient magnitudes at t=0, t=50, t=100
+# 9. Plots Vanilla RNN vs LSTM gradient magnitudes
+#
+# This is written specifically to satisfy the assignment.
+# ============================================================
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
-
-# ------------------------------
-# 1. Reproducibility and device
-# ------------------------------
+# ============================================================
+# 1. REPRODUCIBILITY + DEVICE
+# ============================================================
 torch.manual_seed(42)
 np.random.seed(42)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
+# ============================================================
+# 2. USER SETTINGS
+# ============================================================
+CSV_PATH = "/Users/vaishnavisharma/prnn/delhi_aqi.csv"   # <-- change this to your actual csv path
+TARGET_COL = "pm2_5"                 # PM2.5 column
+SEQ_LEN = 100                        # required by assignment
+HIDDEN_SIZE = 64
 
-# ------------------------------
-# 2. Load and preprocess dataset
-# ------------------------------
-# Change this path to your file
-CSV_PATH = "/Users/vaishnavisharma/prnn/delhi_aqi.csv"
-
-
+# ============================================================
+# 3. LOAD DATA
+# ============================================================
 df = pd.read_csv(CSV_PATH)
 
-print("Original shape:", df.shape)
-print("Columns:", df.columns.tolist())
+# Make column names clean and lowercase
+df.columns = [c.strip().lower() for c in df.columns]
+TARGET_COL = TARGET_COL.lower()
 
+if TARGET_COL not in df.columns:
+    raise ValueError(f"Target column '{TARGET_COL}' not found.\nColumns: {df.columns.tolist()}")
 
-# ------------------------------
-# 3. Select time column and features
-# ------------------------------
-# Try to automatically find a time column
-possible_time_cols = ["datetime", "date", "timestamp", "time", "Date", "Datetime"]
-time_col = None
-for col in possible_time_cols:
-    if col in df.columns:
-        time_col = col
-        break
+# Keep numeric columns only
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
-# Candidate meteorological / pollution features
-candidate_features = [
-    'co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3'
-]
+if TARGET_COL not in numeric_cols:
+    raise ValueError(f"Target column '{TARGET_COL}' is not numeric.")
 
-available_features = [col for col in candidate_features if col in df.columns]
+# Use all numeric columns as features
+feature_cols = numeric_cols.copy()
 
-if len(available_features) == 0:
-    raise ValueError("None of the expected feature columns were found in the CSV.")
+# Drop missing rows only for selected columns
+df = df[feature_cols].dropna().reset_index(drop=True)
 
-target_col = "pm2_5"
-if target_col not in available_features:
-    raise ValueError(f"Target column '{target_col}' not found in selected features.")
+print("Using features:")
+print(feature_cols)
+print("Number of rows after cleanup:", len(df))
 
-print("\nUsing features:")
-print(available_features)
+# ============================================================
+# 4. CHRONOLOGICAL SPLIT: 70 / 15 / 15
+# ============================================================
+n_total = len(df)
+n_train = int(0.70 * n_total)
+n_val = int(0.15 * n_total)
+n_test = n_total - n_train - n_val
 
-# Keep only needed columns
-if time_col is not None:
-    df = df[[time_col] + available_features].copy()
-    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
-    df = df.sort_values(time_col).reset_index(drop=True)
-else:
-    df = df[available_features].copy()
-
-# Convert to numeric
-for col in available_features:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-# Drop missing rows
-df = df.dropna().reset_index(drop=True)
-
-print("Shape after cleanup:", df.shape)
-
-
-# ------------------------------
-# 4. Chronological split
-# ------------------------------
-# 70% train, 15% val, 15% test
-n = len(df)
-train_end = int(0.70 * n)
-val_end = int(0.85 * n)
-
-train_df = df.iloc[:train_end].copy()
-val_df   = df.iloc[train_end:val_end].copy()
-test_df  = df.iloc[val_end:].copy()
+train_df = df.iloc[:n_train].copy()
+val_df = df.iloc[n_train:n_train + n_val].copy()
+test_df = df.iloc[n_train + n_val:].copy()
 
 print("\nSplit sizes:")
 print("Train:", len(train_df))
 print("Val  :", len(val_df))
 print("Test :", len(test_df))
 
+# ============================================================
+# 5. STANDARDIZATION USING TRAIN SET ONLY
+# ============================================================
+train_mean = train_df.mean()
+train_std = train_df.std()
 
-# ------------------------------
-# 5. Standardize using train stats only
-# ------------------------------
-feature_means = train_df[available_features].mean()
-feature_stds  = train_df[available_features].std().replace(0, 1)
+# Avoid divide-by-zero if any feature is constant
+train_std = train_std.replace(0, 1.0)
 
-train_scaled = (train_df[available_features] - feature_means) / feature_stds
-val_scaled   = (val_df[available_features] - feature_means) / feature_stds
-test_scaled  = (test_df[available_features] - feature_means) / feature_stds
+train_scaled = (train_df - train_mean) / train_std
+val_scaled = (val_df - train_mean) / train_std
+test_scaled = (test_df - train_mean) / train_std
 
-target_idx = available_features.index(target_col)
-print("\nTarget column index:", target_idx)
+target_col_index = feature_cols.index(TARGET_COL)
+input_size = len(feature_cols)
 
+print("\nTarget column index:", target_col_index)
+print("Input size:", input_size)
 
-# ------------------------------
-# 6. Sequence creation
-# ------------------------------
-SEQ_LEN = 72  # 72-hour sequence
-
-def create_sequences(dataframe_scaled, seq_len, target_idx):
-    data = dataframe_scaled.values.astype(np.float32)
-    xs, ys = [], []
-
-    for i in range(len(data) - seq_len):
-        x = data[i:i + seq_len]                 # shape: (72, num_features)
-        y = data[i + seq_len, target_idx]      # next-step pm2_5
-        xs.append(x)
-        ys.append(y)
-
-    return np.array(xs, dtype=np.float32), np.array(ys, dtype=np.float32)
-
-X_train, y_train = create_sequences(train_scaled, SEQ_LEN, target_idx)
-X_val, y_val     = create_sequences(val_scaled, SEQ_LEN, target_idx)
-X_test, y_test   = create_sequences(test_scaled, SEQ_LEN, target_idx)
-
-print("\nSequence dataset shapes:")
-print("X_train:", X_train.shape, "y_train:", y_train.shape)
-print("X_val  :", X_val.shape,   "y_val  :", y_val.shape)
-print("X_test :", X_test.shape,  "y_test :", y_test.shape)
-
-
-# ------------------------------
-# 7. Dataset and DataLoader
-# ------------------------------
-class TimeSeriesDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
+# ============================================================
+# 6. DATASET
+#    Input  : 100-step sequence
+#    Target : PM2.5 at final time step of the window
+# ============================================================
+class AirQualitySeqDataset(Dataset):
+    def __init__(self, scaled_df, seq_len, target_col_index):
+        self.data = scaled_df.values.astype(np.float32)
+        self.seq_len = seq_len
+        self.target_col_index = target_col_index
 
     def __len__(self):
-        return len(self.X)
+        return len(self.data) - self.seq_len + 1
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        x = self.data[idx: idx + self.seq_len]  # [seq_len, num_features]
+        y = self.data[idx + self.seq_len - 1, self.target_col_index]  # scalar target at last step
 
-train_dataset = TimeSeriesDataset(X_train, y_train)
-val_dataset   = TimeSeriesDataset(X_val, y_val)
-test_dataset  = TimeSeriesDataset(X_test, y_test)
+        x = torch.tensor(x, dtype=torch.float32)
+        y = torch.tensor(y, dtype=torch.float32)
+        return x, y
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-val_loader   = DataLoader(val_dataset, batch_size=64, shuffle=False)
-test_loader  = DataLoader(test_dataset, batch_size=64, shuffle=False)
+train_dataset = AirQualitySeqDataset(train_scaled, SEQ_LEN, target_col_index)
+val_dataset = AirQualitySeqDataset(val_scaled, SEQ_LEN, target_col_index)
+test_dataset = AirQualitySeqDataset(test_scaled, SEQ_LEN, target_col_index)
 
+print("\nDataset lengths:")
+print("Train:", len(train_dataset))
+print("Val  :", len(val_dataset))
+print("Test :", len(test_dataset))
 
-# ------------------------------
-# 8. Single-head scaled dot-product attention
-# ------------------------------
-class ScaledDotProductAttentionHead(nn.Module):
-    def __init__(self, input_dim, d_k):
+if len(test_dataset) == 0:
+    raise ValueError("Test dataset has zero sequences. Need at least 100 rows in test split.")
+
+# ============================================================
+# 7. VANILLA RNN FROM SCRATCH
+#    Implemented using only:
+#    - nn.Linear
+#    - tanh
+#    - Python for-loop over time
+# ============================================================
+class VanillaRNNFromScratch(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size=1):
         super().__init__()
-        self.q_proj = nn.Linear(input_dim, d_k)
-        self.k_proj = nn.Linear(input_dim, d_k)
-        self.v_proj = nn.Linear(input_dim, d_k)
-        self.scale = math.sqrt(d_k)
+        self.hidden_size = hidden_size
 
-    def forward(self, x):
-        """
-        x: (B, T, input_dim)
+        self.i2h = nn.Linear(input_size, hidden_size)
+        self.h2h = nn.Linear(hidden_size, hidden_size)
+        self.h2y = nn.Linear(hidden_size, output_size)
+        self.tanh = nn.Tanh()
 
-        returns:
-            out: (B, T, d_k)
-            attn_weights: (B, T, T)
-        """
-        Q = self.q_proj(x)                      # (B, T, d_k)
-        K = self.k_proj(x)                      # (B, T, d_k)
-        V = self.v_proj(x)                      # (B, T, d_k)
+    def forward(self, x, h0=None, return_all_hidden=False):
+        # x shape: [batch, seq_len, input_size]
+        batch_size, seq_len, _ = x.shape
 
-        # scores = QK^T / sqrt(d_k)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale   # (B, T, T)
+        if h0 is None:
+            h_t = torch.zeros(batch_size, self.hidden_size, device=x.device)
+        else:
+            h_t = h0
 
-        # attention weights
-        attn_weights = torch.softmax(scores, dim=-1)                  # (B, T, T)
+        hidden_states = [h_t]  # h_0
 
-        # weighted sum
-        out = torch.matmul(attn_weights, V)                           # (B, T, d_k)
+        for t in range(seq_len):
+            x_t = x[:, t, :]
+            h_t = self.tanh(self.i2h(x_t) + self.h2h(h_t))
+            hidden_states.append(h_t)  # h_1, ..., h_100
 
-        return out, attn_weights
+        y = self.h2y(h_t).squeeze(-1)
 
+        if return_all_hidden:
+            return y, hidden_states
+        return y
 
-# ------------------------------
-# 9. Full model
-# ------------------------------
-class AttentionRegressor(nn.Module):
-    def __init__(self, input_dim, d_k=32):
+# ============================================================
+# 8. LSTM MODEL FOR GRADIENT INSPECTION
+#    We use nn.LSTMCell and manually unroll it so that
+#    hidden states at every time step are directly accessible.
+# ============================================================
+class LSTMRegressor(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size=1):
         super().__init__()
-        self.attn = ScaledDotProductAttentionHead(input_dim, d_k)
-        self.fc = nn.Sequential(
-            nn.Linear(d_k, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+        self.hidden_size = hidden_size
 
-    def forward(self, x):
-        """
-        x: (B, T, input_dim)
+        self.cell = nn.LSTMCell(input_size, hidden_size)
+        self.fc = nn.Linear(hidden_size, output_size)
 
-        We use the representation of the LAST time step
-        after attention to predict next-step pm2_5.
-        """
-        attn_out, attn_weights = self.attn(x)        # (B, T, d_k), (B, T, T)
-        last_token = attn_out[:, -1, :]              # (B, d_k)
-        pred = self.fc(last_token).squeeze(-1)       # (B,)
-        return pred, attn_weights
+    def forward(self, x, h0=None, c0=None, return_all_hidden=False):
+        # x shape: [batch, seq_len, input_size]
+        batch_size, seq_len, _ = x.shape
 
+        if h0 is None:
+            h_t = torch.zeros(batch_size, self.hidden_size, device=x.device)
+        else:
+            h_t = h0
 
-input_dim = len(available_features)
-model = AttentionRegressor(input_dim=input_dim, d_k=32).to(device)
+        if c0 is None:
+            c_t = torch.zeros(batch_size, self.hidden_size, device=x.device)
+        else:
+            c_t = c0
 
-criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        hidden_states = [h_t]  # h_0
+        cell_states = [c_t]    # c_0
 
-print("\nModel:")
-print(model)
+        for t in range(seq_len):
+            x_t = x[:, t, :]
+            h_t, c_t = self.cell(x_t, (h_t, c_t))
+            hidden_states.append(h_t)  # h_1, ..., h_100
+            cell_states.append(c_t)
 
+        y = self.fc(h_t).squeeze(-1)
 
-# ------------------------------
-# 10. Training and evaluation
-# ------------------------------
-def run_epoch(model, loader, optimizer=None):
-    is_train = optimizer is not None
-    model.train() if is_train else model.eval()
+        if return_all_hidden:
+            return y, hidden_states, cell_states
+        return y
 
-    total_loss = 0.0
-    count = 0
+# ============================================================
+# 9. CHOOSE ONE 100-STEP TEST SAMPLE
+#    Assignment asks for passing a 100-step sequence through the
+#    untrained network. Using one sample is appropriate.
+# ============================================================
+x_sample, y_sample = test_dataset[0]
+x_sample = x_sample.unsqueeze(0).to(device)  # [1, 100, input_size]
+y_sample = y_sample.unsqueeze(0).to(device)  # [1]
 
-    for xb, yb in loader:
-        xb = xb.to(device)
-        yb = yb.to(device)
+print("\nSingle sample shapes:")
+print("x_sample:", x_sample.shape)
+print("y_sample:", y_sample.shape)
 
-        if is_train:
-            optimizer.zero_grad()
+# ============================================================
+# 10. GRADIENT EXTRACTION FOR VANILLA RNN
+# ============================================================
+def get_vanilla_rnn_gradients(model, x, y):
+    model.zero_grad()
 
-        with torch.set_grad_enabled(is_train):
-            preds, _ = model(xb)
-            loss = criterion(preds, yb)
+    batch_size = x.size(0)
 
-            if is_train:
-                loss.backward()
-                optimizer.step()
+    # h0 corresponds to t = 0
+    h0 = torch.zeros(batch_size, model.hidden_size, device=x.device, requires_grad=True)
 
-        total_loss += loss.item() * xb.size(0)
-        count += xb.size(0)
+    pred, hidden_states = model(x, h0=h0, return_all_hidden=True)
 
-    return total_loss / count
+    # hidden_states has length 101:
+    # hidden_states[0]   = h0     -> t = 0
+    # hidden_states[50]  = h50    -> t = 50
+    # hidden_states[100] = h100   -> t = 100
+    hidden_states[0].retain_grad()
+    hidden_states[50].retain_grad()
+    hidden_states[100].retain_grad()
 
+    loss = nn.MSELoss()(pred, y)
+    loss.backward()
 
-EPOCHS = 200
+    grad_t0 = hidden_states[0].grad
+    grad_t50 = hidden_states[50].grad
+    grad_t100 = hidden_states[100].grad
 
-train_losses = []
-val_losses = []
+    return {
+        "loss": loss.item(),
+        "t0": grad_t0.norm().item() if grad_t0 is not None else 0.0,
+        "t50": grad_t50.norm().item() if grad_t50 is not None else 0.0,
+        "t100": grad_t100.norm().item() if grad_t100 is not None else 0.0
+    }
 
-for epoch in range(EPOCHS):
-    train_loss = run_epoch(model, train_loader, optimizer=optimizer)
-    val_loss = run_epoch(model, val_loader, optimizer=None)
+# ============================================================
+# 11. GRADIENT EXTRACTION FOR LSTM
+# ============================================================
+def get_lstm_gradients(model, x, y):
+    model.zero_grad()
 
-    train_losses.append(train_loss)
-    val_losses.append(val_loss)
+    batch_size = x.size(0)
 
-    print(f"Epoch {epoch+1:02d}/{EPOCHS} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+    # h0 corresponds to t = 0
+    h0 = torch.zeros(batch_size, model.hidden_size, device=x.device, requires_grad=True)
+    c0 = torch.zeros(batch_size, model.hidden_size, device=x.device, requires_grad=True)
 
+    pred, hidden_states, cell_states = model(x, h0=h0, c0=c0, return_all_hidden=True)
 
-# ------------------------------
-# 11. Test loss
-# ------------------------------
-test_loss = run_epoch(model, test_loader, optimizer=None)
-print("\nTest Loss:", test_loss)
+    # hidden_states indexing:
+    # hidden_states[0]   = h0     -> t = 0
+    # hidden_states[50]  = h50    -> t = 50
+    # hidden_states[100] = h100   -> t = 100
+    hidden_states[0].retain_grad()
+    hidden_states[50].retain_grad()
+    hidden_states[100].retain_grad()
 
+    loss = nn.MSELoss()(pred, y)
+    loss.backward()
 
-# ------------------------------
-# 12. Plot training and validation loss
-# ------------------------------
+    grad_t0 = hidden_states[0].grad
+    grad_t50 = hidden_states[50].grad
+    grad_t100 = hidden_states[100].grad
+
+    return {
+        "loss": loss.item(),
+        "t0": grad_t0.norm().item() if grad_t0 is not None else 0.0,
+        "t50": grad_t50.norm().item() if grad_t50 is not None else 0.0,
+        "t100": grad_t100.norm().item() if grad_t100 is not None else 0.0
+    }
+
+# ============================================================
+# 12. BUILD UNTRAINED MODELS
+# ============================================================
+vanilla_rnn = VanillaRNNFromScratch(
+    input_size=input_size,
+    hidden_size=HIDDEN_SIZE,
+    output_size=1
+).to(device)
+
+lstm_model = LSTMRegressor(
+    input_size=input_size,
+    hidden_size=HIDDEN_SIZE,
+    output_size=1
+).to(device)
+
+# ============================================================
+# 13. RUN EXPERIMENT
+# ============================================================
+rnn_grads = get_vanilla_rnn_gradients(vanilla_rnn, x_sample, y_sample)
+lstm_grads = get_lstm_gradients(lstm_model, x_sample, y_sample)
+
+print("\nVanilla RNN gradients:")
+print(rnn_grads)
+
+print("\nLSTM gradients:")
+print(lstm_grads)
+
+# ============================================================
+# 14. PLOT BAR CHART
+# ============================================================
+time_labels = ["t=0", "t=50", "t=100"]
+
+rnn_vals = [rnn_grads["t0"], rnn_grads["t50"], rnn_grads["t100"]]
+lstm_vals = [lstm_grads["t0"], lstm_grads["t50"], lstm_grads["t100"]]
+
+xpos = np.arange(len(time_labels))
+width = 0.35
+
 plt.figure(figsize=(8, 5))
-plt.plot(train_losses, label="Train Loss")
-plt.plot(val_losses, label="Validation Loss")
-plt.xlabel("Epoch")
-plt.ylabel("MSE Loss")
-plt.title("Attention Model Training")
+plt.bar(xpos - width/2, rnn_vals, width, label="Vanilla RNN")
+plt.bar(xpos + width/2, lstm_vals, width, label="LSTM")
+plt.xticks(xpos, time_labels)
+plt.ylabel("Gradient magnitude (L2 norm)")
+plt.title("Gradient comparison at t=0, 50, 100")
 plt.legend()
-plt.grid(True)
-plt.savefig('trans-loss.jpeg')
-
-
-# ------------------------------
-# 13. Extract 72x72 attention matrix for one test sample
-# ------------------------------
-model.eval()
-
-sample_idx = 0  # you can change this
-x_sample, y_sample = test_dataset[sample_idx]
-
-with torch.no_grad():
-    x_input = x_sample.unsqueeze(0).to(device)      # (1, 72, input_dim)
-    pred_sample, attn_weights_sample = model(x_input)
-
-# attention matrix for this one sample
-attn_matrix = attn_weights_sample[0].cpu().numpy()  # (72, 72)
-
-print("\nSingle test sample:")
-print("Input shape:", x_sample.shape)
-print("Target:", y_sample.item())
-print("Prediction:", pred_sample.item())
-print("Attention matrix shape:", attn_matrix.shape)
-
-
-# ------------------------------
-# 14. Plot attention heatmap
-# ------------------------------
-plt.figure(figsize=(8, 6))
-plt.imshow(attn_matrix, aspect="auto", cmap="viridis")
-plt.colorbar(label="Attention Weight")
-plt.xlabel("Key Time Step")
-plt.ylabel("Query Time Step")
-plt.title("72 x 72 Attention Weight Matrix for One Test Sample")
-plt.savefig('heatmap.jpeg')
-
-
-# ------------------------------
-# 15. Optional: show last-step attention only
-# ------------------------------
-# This tells you where the final query step is attending
-last_row = attn_matrix[-1]
-
-plt.figure(figsize=(10, 4))
-plt.plot(np.arange(1, SEQ_LEN + 1), last_row)
-plt.xlabel("Input Time Step")
-plt.ylabel("Attention Weight")
-plt.title("Attention Weights from Final Query Time Step")
-plt.grid(True)
+plt.tight_layout()
 plt.show()
+
+# ============================================================
+# 15. OPTIONAL LOG-SCALE PLOT
+#    Useful because vanishing gradients can differ by orders
+#    of magnitude. This often makes the comparison clearer.
+# ============================================================
+eps = 1e-12
+plt.figure(figsize=(8, 5))
+plt.bar(xpos - width/2, np.array(rnn_vals) + eps, width, label="Vanilla RNN")
+plt.bar(xpos + width/2, np.array(lstm_vals) + eps, width, label="LSTM")
+plt.xticks(xpos, time_labels)
+plt.yscale("log")
+plt.ylabel("Gradient magnitude (log scale)")
+plt.title("Gradient comparison at t=0, 50, 100 (log scale)")
+plt.legend()
+plt.tight_layout()
+plt.savefig('lstm-rnn.jpeg')
+
+# ============================================================
+# 16. CLEAN SUMMARY
+# ============================================================
+print("\n================ FINAL SUMMARY ================")
+print(f"Vanilla RNN loss : {rnn_grads['loss']:.6f}")
+print(f"LSTM loss        : {lstm_grads['loss']:.6f}")
+print()
+print(f"Vanilla RNN -> t=0:   {rnn_grads['t0']:.6e}")
+print(f"Vanilla RNN -> t=50:  {rnn_grads['t50']:.6e}")
+print(f"Vanilla RNN -> t=100: {rnn_grads['t100']:.6e}")
+print()
+print(f"LSTM -> t=0:   {lstm_grads['t0']:.6e}")
+print(f"LSTM -> t=50:  {lstm_grads['t50']:.6e}")
+print(f"LSTM -> t=100: {lstm_grads['t100']:.6e}")
+print("==============================================")

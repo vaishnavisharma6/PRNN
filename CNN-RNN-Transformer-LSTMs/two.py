@@ -1,5 +1,4 @@
-import math
-import copy
+import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -8,422 +7,320 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-
-# ------------------------------
-# 1. Reproducibility and device
-# ------------------------------
+# ============================================================
+# 1. REPRODUCIBILITY + DEVICE
+# ============================================================
 torch.manual_seed(42)
 np.random.seed(42)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
+# ============================================================
+# 2. USER SETTINGS
+# ============================================================
+CSV_PATH = "/Users/vaishnavisharma/prnn/delhi_aqi.csv"   # <-- change this
+TARGET_COL = "pm2_5"
+SEQ_LEN = 100
+BATCH_SIZE = 64
+HIDDEN_SIZE = 64
+NUM_EPOCHS = 15
+LEARNING_RATE = 1e-3
 
-# ------------------------------
-# 2. Load dataset
-# ------------------------------
-# Change path as needed
-CSV_PATH = "/Users/vaishnavisharma/prnn/delhi_aqi.csv"
-# Example:
-# CSV_PATH = "/content/delhi_aqi.csv"
-
+# ============================================================
+# 3. LOAD DATA
+# ============================================================
 df = pd.read_csv(CSV_PATH)
 
-print("Original shape:", df.shape)
-print("Columns:", df.columns.tolist())
+df.columns = [c.strip().lower() for c in df.columns]
+TARGET_COL = TARGET_COL.lower()
 
+if TARGET_COL not in df.columns:
+    raise ValueError(f"Target column '{TARGET_COL}' not found.\nColumns: {df.columns.tolist()}")
 
-# ------------------------------
-# 3. Select columns
-# ------------------------------
-possible_time_cols = ["datetime", "date", "timestamp", "time", "Date", "Datetime"]
-time_col = None
-for col in possible_time_cols:
-    if col in df.columns:
-        time_col = col
-        break
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
-candidate_features = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
-available_features = [col for col in candidate_features if col in df.columns]
+if TARGET_COL not in numeric_cols:
+    raise ValueError(f"Target column '{TARGET_COL}' is not numeric.")
 
-if len(available_features) == 0:
-    raise ValueError("Expected feature columns not found in dataset.")
+feature_cols = numeric_cols.copy()
 
-target_col = "pm2_5"
-if target_col not in available_features:
-    raise ValueError("pm2_5 not found in selected features.")
+df = df[feature_cols].dropna().reset_index(drop=True)
 
-print("\nUsing features:")
-print(available_features)
+print("Using features:")
+print(feature_cols)
+print("Number of rows after cleanup:", len(df))
 
-if time_col is not None:
-    df = df[[time_col] + available_features].copy()
-    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
-    df = df.sort_values(time_col).reset_index(drop=True)
-else:
-    df = df[available_features].copy()
+# ============================================================
+# 4. CHRONOLOGICAL SPLIT: 70 / 15 / 15
+# ============================================================
+n_total = len(df)
+n_train = int(0.70 * n_total)
+n_val = int(0.15 * n_total)
+n_test = n_total - n_train - n_val
 
-for col in available_features:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-df = df.dropna().reset_index(drop=True)
-
-print("Rows after cleanup:", len(df))
-
-
-# ------------------------------
-# 4. Chronological split
-# ------------------------------
-n = len(df)
-train_end = int(0.70 * n)
-val_end = int(0.85 * n)
-
-train_df = df.iloc[:train_end].copy()
-val_df   = df.iloc[train_end:val_end].copy()
-test_df  = df.iloc[val_end:].copy()
+train_df = df.iloc[:n_train].copy()
+val_df = df.iloc[n_train:n_train + n_val].copy()
+test_df = df.iloc[n_train + n_val:].copy()
 
 print("\nSplit sizes:")
 print("Train:", len(train_df))
 print("Val  :", len(val_df))
 print("Test :", len(test_df))
 
+# ============================================================
+# 5. STANDARDIZATION USING TRAIN ONLY
+# ============================================================
+train_mean = train_df.mean()
+train_std = train_df.std().replace(0, 1.0)
 
-# ------------------------------
-# 5. Standardization using train only
-# ------------------------------
-feature_means = train_df[available_features].mean()
-feature_stds  = train_df[available_features].std().replace(0, 1)
+train_scaled = (train_df - train_mean) / train_std
+val_scaled = (val_df - train_mean) / train_std
+test_scaled = (test_df - train_mean) / train_std
 
-train_scaled = (train_df[available_features] - feature_means) / feature_stds
-val_scaled   = (val_df[available_features] - feature_means) / feature_stds
-test_scaled  = (test_df[available_features] - feature_means) / feature_stds
+target_col_index = feature_cols.index(TARGET_COL)
+input_size = len(feature_cols)
 
-target_idx = available_features.index(target_col)
-print("\nTarget column index:", target_idx)
+print("\nTarget column index:", target_col_index)
+print("Input size:", input_size)
 
-
-# ------------------------------
-# 6. Create 72-hour sequences
-# ------------------------------
-SEQ_LEN = 72
-
-def create_sequences(dataframe_scaled, seq_len, target_idx):
-    data = dataframe_scaled.values.astype(np.float32)
-    xs, ys = [], []
-
-    for i in range(len(data) - seq_len):
-        x = data[i:i + seq_len]            # shape: (72, num_features)
-        y = data[i + seq_len, target_idx]  # next-step pm2_5
-        xs.append(x)
-        ys.append(y)
-
-    return np.array(xs, dtype=np.float32), np.array(ys, dtype=np.float32)
-
-X_train, y_train = create_sequences(train_scaled, SEQ_LEN, target_idx)
-X_val, y_val     = create_sequences(val_scaled, SEQ_LEN, target_idx)
-X_test, y_test   = create_sequences(test_scaled, SEQ_LEN, target_idx)
-
-print("\nSequence shapes:")
-print("X_train:", X_train.shape, "y_train:", y_train.shape)
-print("X_val  :", X_val.shape,   "y_val  :", y_val.shape)
-print("X_test :", X_test.shape,  "y_test :", y_test.shape)
-
-
-# ------------------------------
-# 7. Dataset and loaders
-# ------------------------------
-class TimeSeriesDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
+# ============================================================
+# 6. DATASET
+#    Input  : past 100 time steps
+#    Output : PM2.5 at final step of that window
+# ============================================================
+class AirQualitySeqDataset(Dataset):
+    def __init__(self, scaled_df, seq_len, target_col_index):
+        self.data = scaled_df.values.astype(np.float32)
+        self.seq_len = seq_len
+        self.target_col_index = target_col_index
 
     def __len__(self):
-        return len(self.X)
+        return len(self.data) - self.seq_len + 1
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        x = self.data[idx : idx + self.seq_len]   # [seq_len, num_features]
+        y = self.data[idx + self.seq_len - 1, self.target_col_index]  # scalar
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
-train_dataset = TimeSeriesDataset(X_train, y_train)
-val_dataset   = TimeSeriesDataset(X_val, y_val)
-test_dataset  = TimeSeriesDataset(X_test, y_test)
+train_dataset = AirQualitySeqDataset(train_scaled, SEQ_LEN, target_col_index)
+val_dataset = AirQualitySeqDataset(val_scaled, SEQ_LEN, target_col_index)
+test_dataset = AirQualitySeqDataset(test_scaled, SEQ_LEN, target_col_index)
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-val_loader   = DataLoader(val_dataset, batch_size=64, shuffle=False)
-test_loader  = DataLoader(test_dataset, batch_size=64, shuffle=False)
+print("\nDataset lengths:")
+print("Train:", len(train_dataset))
+print("Val  :", len(val_dataset))
+print("Test :", len(test_dataset))
 
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# ------------------------------
-# 8. Sinusoidal positional encoding
-# ------------------------------
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+# ============================================================
+# 7. MODELS
+# ============================================================
+class LSTMRegressor(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size=1):
         super().__init__()
-
-        pe = torch.zeros(max_len, d_model)   # (max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # (max_len, 1)
-
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
-        )
-
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
-        pe = pe.unsqueeze(0)   # (1, max_len, d_model)
-        self.register_buffer("pe", pe)
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        """
-        x: (B, T, d_model)
-        """
-        T = x.size(1)
-        return x + self.pe[:, :T, :]
+        # x: [batch, seq_len, input_size]
+        out, (hn, cn) = self.lstm(x)
+        # use final time step output
+        y = self.fc(out[:, -1, :]).squeeze(-1)
+        return y
 
 
-# ------------------------------
-# 9. Simple Transformer Encoder block
-# ------------------------------
-class TransformerEncoderBlock(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
+class GRURegressor(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size=1):
         super().__init__()
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=nhead,
-            dropout=dropout,
-            batch_first=True
-        )
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model)
-        )
-
-        self.dropout = nn.Dropout(dropout)
+        self.hidden_size = hidden_size
+        self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        # Self-attention
-        attn_out, _ = self.attn(x, x, x)     # queries=keys=values=x
-        x = self.norm1(x + self.dropout(attn_out))
+        # x: [batch, seq_len, input_size]
+        out, hn = self.gru(x)
+        # use final time step output
+        y = self.fc(out[:, -1, :]).squeeze(-1)
+        return y
 
-        # Feedforward
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + self.dropout(ffn_out))
-
-        return x
-
-
-# ------------------------------
-# 10. Forecasting model
-# ------------------------------
-class TimeSeriesTransformer(nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        d_model=64,
-        nhead=4,
-        dim_feedforward=128,
-        num_layers=2,
-        dropout=0.1,
-        use_positional_encoding=False,
-        seq_len=72
-    ):
-        super().__init__()
-
-        self.use_positional_encoding = use_positional_encoding
-
-        # Project raw features to transformer embedding dimension
-        self.input_proj = nn.Linear(input_dim, d_model)
-
-        if use_positional_encoding:
-            self.pos_encoder = SinusoidalPositionalEncoding(d_model, max_len=seq_len)
-
-        self.layers = nn.ModuleList([
-            TransformerEncoderBlock(d_model, nhead, dim_feedforward, dropout)
-            for _ in range(num_layers)
-        ])
-
-        # Final regression head
-        self.regressor = nn.Sequential(
-            nn.Linear(d_model, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-
-    def forward(self, x):
-        """
-        x: (B, T, input_dim)
-        """
-        x = self.input_proj(x)   # (B, T, d_model)
-
-        if self.use_positional_encoding:
-            x = self.pos_encoder(x)
-
-        for layer in self.layers:
-            x = layer(x)
-
-        # Use final time step representation for forecasting next pm2_5
-        last_token = x[:, -1, :]         # (B, d_model)
-        out = self.regressor(last_token).squeeze(-1)   # (B,)
-        return out
+# ============================================================
+# 8. HELPER FUNCTIONS
+# ============================================================
+def count_trainable_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-# ------------------------------
-# 11. Training utilities
-# ------------------------------
-def run_epoch(model, loader, criterion, optimizer=None):
-    is_train = optimizer is not None
-    model.train() if is_train else model.eval()
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    total_samples = 0
 
-    total_loss = 0.0
-    total_count = 0
+    for x_batch, y_batch in loader:
+        x_batch = x_batch.to(device)
+        y_batch = y_batch.to(device)
 
-    for xb, yb in loader:
-        xb = xb.to(device)
-        yb = yb.to(device)
+        optimizer.zero_grad()
+        preds = model(x_batch)
+        loss = criterion(preds, y_batch)
+        loss.backward()
+        optimizer.step()
 
-        if is_train:
-            optimizer.zero_grad()
+        batch_size = x_batch.size(0)
+        running_loss += loss.item() * batch_size
+        total_samples += batch_size
 
-        with torch.set_grad_enabled(is_train):
-            preds = model(xb)
-            loss = criterion(preds, yb)
-
-            if is_train:
-                loss.backward()
-                optimizer.step()
-
-        total_loss += loss.item() * xb.size(0)
-        total_count += xb.size(0)
-
-    return total_loss / total_count
+    return running_loss / total_samples
 
 
-def train_model(model, train_loader, val_loader, epochs=15, lr=1e-3):
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for x_batch, y_batch in loader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+
+            preds = model(x_batch)
+            loss = criterion(preds, y_batch)
+
+            batch_size = x_batch.size(0)
+            running_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+    return running_loss / total_samples
+
+
+def train_model(model, train_loader, val_loader, num_epochs, lr, device, model_name="Model"):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     train_losses = []
     val_losses = []
+    epoch_times = []
 
-    best_val_loss = float("inf")
-    best_state = copy.deepcopy(model.state_dict())
+    print(f"\nTraining {model_name}...")
+    for epoch in range(1, num_epochs + 1):
+        start_time = time.time()
 
-    for epoch in range(epochs):
-        train_loss = run_epoch(model, train_loader, criterion, optimizer)
-        val_loss = run_epoch(model, val_loader, criterion, optimizer=None)
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss = evaluate(model, val_loader, criterion, device)
+
+        end_time = time.time()
+        epoch_time = end_time - start_time
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
+        epoch_times.append(epoch_time)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = copy.deepcopy(model.state_dict())
+        print(
+            f"Epoch {epoch:02d}/{num_epochs} | "
+            f"Train MSE: {train_loss:.6f} | "
+            f"Val MSE: {val_loss:.6f} | "
+            f"Time: {epoch_time:.2f} sec"
+        )
 
-        print(f"Epoch {epoch+1:02d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "epoch_times": epoch_times,
+        "final_val_mse": val_losses[-1],
+        "avg_epoch_time": float(np.mean(epoch_times))
+    }
 
-    model.load_state_dict(best_state)
-    return model, train_losses, val_losses, best_val_loss
+# ============================================================
+# 9. BUILD MODELS
+# ============================================================
+lstm_model = LSTMRegressor(input_size=input_size, hidden_size=HIDDEN_SIZE).to(device)
+gru_model = GRURegressor(input_size=input_size, hidden_size=HIDDEN_SIZE).to(device)
 
+lstm_params = count_trainable_parameters(lstm_model)
+gru_params = count_trainable_parameters(gru_model)
 
-def evaluate_test(model, test_loader):
-    criterion = nn.MSELoss()
-    test_loss = run_epoch(model, test_loader, criterion, optimizer=None)
-    return test_loss
+print("\nTrainable parameter counts:")
+print("LSTM:", lstm_params)
+print("GRU :", gru_params)
 
-
-# ------------------------------
-# 12. Train model WITHOUT positional encoding
-# ------------------------------
-input_dim = len(available_features)
-
-model_no_pos = TimeSeriesTransformer(
-    input_dim=input_dim,
-    d_model=64,
-    nhead=4,
-    dim_feedforward=128,
-    num_layers=2,
-    dropout=0.1,
-    use_positional_encoding=False,
-    seq_len=SEQ_LEN
-).to(device)
-
-print("\nTraining model WITHOUT positional encoding...\n")
-model_no_pos, train_losses_no_pos, val_losses_no_pos, best_val_no_pos = train_model(
-    model_no_pos, train_loader, val_loader, epochs=15, lr=1e-3
+# ============================================================
+# 10. TRAIN BOTH MODELS
+# ============================================================
+lstm_results = train_model(
+    model=lstm_model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    num_epochs=NUM_EPOCHS,
+    lr=LEARNING_RATE,
+    device=device,
+    model_name="LSTM"
 )
 
-test_loss_no_pos = evaluate_test(model_no_pos, test_loader)
-
-print("\nBest Validation Loss WITHOUT positional encoding:", best_val_no_pos)
-print("Test Loss WITHOUT positional encoding:", test_loss_no_pos)
-
-
-# ------------------------------
-# 13. Train model WITH positional encoding
-# ------------------------------
-model_with_pos = TimeSeriesTransformer(
-    input_dim=input_dim,
-    d_model=64,
-    nhead=4,
-    dim_feedforward=128,
-    num_layers=2,
-    dropout=0.1,
-    use_positional_encoding=True,
-    seq_len=SEQ_LEN
-).to(device)
-
-print("\nTraining model WITH sinusoidal positional encoding...\n")
-model_with_pos, train_losses_with_pos, val_losses_with_pos, best_val_with_pos = train_model(
-    model_with_pos, train_loader, val_loader, epochs=15, lr=1e-3
+gru_results = train_model(
+    model=gru_model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    num_epochs=NUM_EPOCHS,
+    lr=LEARNING_RATE,
+    device=device,
+    model_name="GRU"
 )
 
-test_loss_with_pos = evaluate_test(model_with_pos, test_loader)
+# ============================================================
+# 11. FINAL COMPARISON
+# ============================================================
+print("\n================ FINAL COMPARISON ================")
+print(f"LSTM Parameters         : {lstm_params}")
+print(f"GRU Parameters          : {gru_params}")
+print()
+print(f"LSTM Avg Epoch Time     : {lstm_results['avg_epoch_time']:.4f} sec")
+print(f"GRU Avg Epoch Time      : {gru_results['avg_epoch_time']:.4f} sec")
+print()
+print(f"LSTM Final Val MSE      : {lstm_results['final_val_mse']:.6f}")
+print(f"GRU Final Val MSE       : {gru_results['final_val_mse']:.6f}")
+print("==================================================")
 
-print("\nBest Validation Loss WITH positional encoding:", best_val_with_pos)
-print("Test Loss WITH positional encoding:", test_loss_with_pos)
+# ============================================================
+# 12. PLOT VALIDATION MSE CURVES
+# ============================================================
+epochs = np.arange(1, NUM_EPOCHS + 1)
 
-
-# ------------------------------
-# 14. Compare losses
-# ------------------------------
-print("\n========== FINAL COMPARISON ==========")
-print(f"Validation Loss WITHOUT positional encoding : {best_val_no_pos:.6f}")
-print(f"Validation Loss WITH positional encoding    : {best_val_with_pos:.6f}")
-print(f"Test Loss WITHOUT positional encoding       : {test_loss_no_pos:.6f}")
-print(f"Test Loss WITH positional encoding          : {test_loss_with_pos:.6f}")
-
-
-# ------------------------------
-# 15. Plot training curves
-# ------------------------------
-plt.figure(figsize=(9, 5))
-plt.plot(train_losses_no_pos, label="Train - No Positional Encoding")
-plt.plot(val_losses_no_pos, label="Val - No Positional Encoding")
-plt.plot(train_losses_with_pos, label="Train - With Positional Encoding")
-plt.plot(val_losses_with_pos, label="Val - With Positional Encoding")
-plt.xlabel("Epoch")
-plt.ylabel("MSE Loss")
-plt.title("Transformer Encoder: With vs Without Positional Encoding")
-plt.legend()
-plt.grid(True)
-plt.savefig('encoder_loss.jpeg')
-
-
-# ------------------------------
-# 16. Plot side-by-side validation curves only
-# ------------------------------
 plt.figure(figsize=(8, 5))
-plt.plot(val_losses_no_pos, label="Without Positional Encoding")
-plt.plot(val_losses_with_pos, label="With Positional Encoding")
+plt.plot(epochs, lstm_results["val_losses"], marker='o', label="LSTM Val MSE")
+plt.plot(epochs, gru_results["val_losses"], marker='o', label="GRU Val MSE")
 plt.xlabel("Epoch")
-plt.ylabel("Validation Loss")
-plt.title("Validation Loss Comparison")
+plt.ylabel("Validation MSE")
+plt.title("Validation MSE: LSTM vs GRU")
 plt.legend()
-plt.grid(True)
-plt.savefig('val-encoder.jpeg')
+plt.tight_layout()
+plt.savefig('lstm-gru.jpeg')
+
+# ============================================================
+# 13. PLOT EPOCH TIME COMPARISON
+# ============================================================
+plt.figure(figsize=(8, 5))
+plt.plot(epochs, lstm_results["epoch_times"], marker='o', label="LSTM Epoch Time")
+plt.plot(epochs, gru_results["epoch_times"], marker='o', label="GRU Epoch Time")
+plt.xlabel("Epoch")
+plt.ylabel("Time per epoch (seconds)")
+plt.title("Training Time per Epoch: LSTM vs GRU")
+plt.legend()
+plt.tight_layout()
+plt.savefig('time-lstm-gru.jpeg')
+
+# ============================================================
+# 14. OPTIONAL TEST EVALUATION
+# ============================================================
+criterion = nn.MSELoss()
+
+lstm_test_mse = evaluate(lstm_model, test_loader, criterion, device)
+gru_test_mse = evaluate(gru_model, test_loader, criterion, device)
+
+print("\n================ TEST SET RESULTS ================")
+print(f"LSTM Test MSE : {lstm_test_mse:.6f}")
+print(f"GRU Test MSE  : {gru_test_mse:.6f}")
+print("==================================================")

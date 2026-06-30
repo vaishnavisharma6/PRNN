@@ -1,480 +1,407 @@
-# ============================================
-# Phase 5.15: Vision Transformer (ViT)
-# PlantVillage classification from scratch
-# ============================================
-
-import math
-import copy
+import time
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms
+from torch.utils.data import Dataset, DataLoader
 
-
-# ------------------------------
-# 1. Reproducibility and device
-# ------------------------------
+# ============================================================
+# 1. REPRODUCIBILITY + DEVICE
+# ============================================================
 torch.manual_seed(42)
 np.random.seed(42)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
+# ============================================================
+# 2. USER SETTINGS
+# ============================================================
+CSV_PATH = "/Users/vaishnavisharma/prnn/delhi_aqi.csv"   
+TARGET_COL = "pm2_5"
 
-# ------------------------------
-# 2. Dataset paths
-# ------------------------------
-# Change this to your dataset folder.
-# The folder should contain class subfolders directly inside it.
+INPUT_SEQ_LEN = 72     # past 72 hours
+OUTPUT_SEQ_LEN = 24    # next 24 hours
+
+BATCH_SIZE = 64
+HIDDEN_SIZE = 64
+NUM_EPOCHS = 100
+LEARNING_RATE = 1e-3
+TEACHER_FORCING_RATIO = 0.5
+
+# ============================================================
+# 3. LOAD DATA
+# ============================================================
+df = pd.read_csv(CSV_PATH)
+
+# Clean column names
+df.columns = [c.strip().lower() for c in df.columns]
+TARGET_COL = TARGET_COL.lower()
+
+if TARGET_COL not in df.columns:
+    raise ValueError(f"Target column '{TARGET_COL}' not found.\nColumns: {df.columns.tolist()}")
+
+# Use only numeric columns
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+if TARGET_COL not in numeric_cols:
+    raise ValueError(f"Target column '{TARGET_COL}' is not numeric.")
+
+feature_cols = numeric_cols.copy()
+
+# Drop rows with missing values
+df = df[feature_cols].dropna().reset_index(drop=True)
+
+print("Using features:")
+print(feature_cols)
+print("Number of rows after cleanup:", len(df))
+
+# ============================================================
+# 4. CHRONOLOGICAL SPLIT: 70 / 15 / 15
+# ============================================================
+n_total = len(df)
+n_train = int(0.70 * n_total)
+n_val = int(0.15 * n_total)
+n_test = n_total - n_train - n_val
+
+train_df = df.iloc[:n_train].copy()
+val_df = df.iloc[n_train:n_train + n_val].copy()
+test_df = df.iloc[n_train + n_val:].copy()
+
+print("\nSplit sizes:")
+print("Train:", len(train_df))
+print("Val  :", len(val_df))
+print("Test :", len(test_df))
+
+# ============================================================
+# 5. STANDARDIZE USING TRAIN ONLY
+# ============================================================
+train_mean = train_df.mean()
+train_std = train_df.std().replace(0, 1.0)
+
+train_scaled = (train_df - train_mean) / train_std
+val_scaled = (val_df - train_mean) / train_std
+test_scaled = (test_df - train_mean) / train_std
+
+target_col_index = feature_cols.index(TARGET_COL)
+input_size = len(feature_cols)
+
+print("\nTarget column index:", target_col_index)
+print("Input size:", input_size)
+
+# We will need these later to convert predictions back to original units
+target_mean = train_mean[TARGET_COL]
+target_std = train_std[TARGET_COL]
+
+# ============================================================
+# 6. DATASET FOR SEQ2SEQ
+#
+# Input:
+#   past 72 hours of all features
+#
+# Target:
+#   next 24 hours of PM2.5 only
 #
 # Example:
-# /kaggle/input/plantvillagedataset/color
-# or
-# /content/PlantVillage
-#
-DATA_DIR = "/kaggle/input/plantvillagedataset/color"
+#   x = data[t : t+72]
+#   y = pm2_5[t+72 : t+72+24]
+# ============================================================
+class AirQualitySeq2SeqDataset(Dataset):
+    def __init__(self, scaled_df, input_seq_len, output_seq_len, target_col_index):
+        self.data = scaled_df.values.astype(np.float32)
+        self.input_seq_len = input_seq_len
+        self.output_seq_len = output_seq_len
+        self.target_col_index = target_col_index
 
+    def __len__(self):
+        return len(self.data) - self.input_seq_len - self.output_seq_len + 1
 
-# ------------------------------
-# 3. Image transforms
-# ------------------------------
-# Resize all images to 128x128 as required.
-transform = transforms.Compose([
-    transforms.Resize((128, 128)),
-    transforms.ToTensor(),
-])
+    def __getitem__(self, idx):
+        x = self.data[idx : idx + self.input_seq_len]  # [72, num_features]
 
+        y = self.data[
+            idx + self.input_seq_len : idx + self.input_seq_len + self.output_seq_len,
+            self.target_col_index
+        ]  # [24]
 
-# ------------------------------
-# 4. Load dataset using ImageFolder
-# ------------------------------
-full_dataset = datasets.ImageFolder(root=DATA_DIR, transform=transform)
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
-num_classes = len(full_dataset.classes)
-class_names = full_dataset.classes
+train_dataset = AirQualitySeq2SeqDataset(train_scaled, INPUT_SEQ_LEN, OUTPUT_SEQ_LEN, target_col_index)
+val_dataset = AirQualitySeq2SeqDataset(val_scaled, INPUT_SEQ_LEN, OUTPUT_SEQ_LEN, target_col_index)
+test_dataset = AirQualitySeq2SeqDataset(test_scaled, INPUT_SEQ_LEN, OUTPUT_SEQ_LEN, target_col_index)
 
-print("Number of classes:", num_classes)
-print("Some classes:", class_names[:5])
-print("Total images:", len(full_dataset))
-
-
-# ------------------------------
-# 5. Train / val / test split
-# ------------------------------
-# Here we do 70 / 15 / 15
-dataset_size = len(full_dataset)
-train_size = int(0.70 * dataset_size)
-val_size = int(0.15 * dataset_size)
-test_size = dataset_size - train_size - val_size
-
-train_dataset, val_dataset, test_dataset = random_split(
-    full_dataset,
-    [train_size, val_size, test_size],
-    generator=torch.Generator().manual_seed(42)
-)
-
-print("\nDataset split:")
+print("\nDataset lengths:")
 print("Train:", len(train_dataset))
 print("Val  :", len(val_dataset))
 print("Test :", len(test_dataset))
 
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# ------------------------------
-# 6. DataLoaders
-# ------------------------------
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2)
-val_loader   = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=2)
-test_loader  = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=2)
-
-
-# ------------------------------
-# 7. Visualize one batch
-# ------------------------------
-images, labels = next(iter(train_loader))
-print("\nBatch shape:", images.shape)   # (B, 3, 128, 128)
-print("Labels shape:", labels.shape)
-
-
-# ------------------------------
-# 8. Patch embedding module
-# ------------------------------
-class PatchEmbedding(nn.Module):
-    """
-    Converts image into a sequence of flattened patches,
-    then linearly projects each patch to embedding dimension.
-    """
-
-    def __init__(self, img_size=128, patch_size=16, in_channels=3, embed_dim=128):
+# ============================================================
+# 7. ENCODER
+#
+# The encoder reads the past 72-hour input sequence and
+# compresses it into a final hidden state and cell state.
+# ============================================================
+class Encoder(nn.Module):
+    def __init__(self, input_size, hidden_size):
         super().__init__()
-
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-
-        self.num_patches_per_side = img_size // patch_size
-        self.num_patches = self.num_patches_per_side ** 2
-
-        self.patch_dim = in_channels * patch_size * patch_size
-
-        # Linear projection from flattened patch -> embedding
-        self.proj = nn.Linear(self.patch_dim, embed_dim)
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, batch_first=True)
 
     def forward(self, x):
-        """
-        x: (B, C, H, W)
-        returns: (B, num_patches, embed_dim)
-        """
-        B, C, H, W = x.shape
+        # x shape: [batch, 72, input_size]
+        outputs, (hidden, cell) = self.lstm(x)
 
-        # Split into patches using unfold
-        # After unfold:
-        # x -> (B, C, n_patches_h, n_patches_w, patch_h, patch_w)
-        x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        # outputs: [batch, 72, hidden_size]
+        # hidden : [1, batch, hidden_size]
+        # cell   : [1, batch, hidden_size]
+        return hidden, cell
 
-        # Rearrange dimensions
-        # (B, C, 8, 8, 16, 16) -> (B, 8, 8, C, 16, 16)
-        x = x.permute(0, 2, 3, 1, 4, 5).contiguous()
-
-        # Flatten each patch
-        # -> (B, 64, 3*16*16)
-        x = x.view(B, self.num_patches, self.patch_dim)
-
-        # Project to embedding dimension
-        x = self.proj(x)   # (B, 64, embed_dim)
-
-        return x
-
-
-# ------------------------------
-# 9. Transformer encoder block
-# ------------------------------
-class TransformerEncoderBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, mlp_dim, dropout=0.1):
+# ============================================================
+# 8. DECODER
+#
+# The decoder predicts one future step at a time.
+# Input to decoder at each step:
+#   previous PM2.5 value (scalar)
+#
+# Output:
+#   next PM2.5 value
+# ============================================================
+class Decoder(nn.Module):
+    def __init__(self, hidden_size, output_size=1):
         super().__init__()
+        self.hidden_size = hidden_size
 
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
+        # Decoder input at each step is a single PM2.5 value
+        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
 
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, mlp_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_dim, embed_dim),
-            nn.Dropout(dropout)
-        )
+    def forward(self, x, hidden, cell):
+        # x shape: [batch, 1, 1]
+        output, (hidden, cell) = self.lstm(x, (hidden, cell))
 
-    def forward(self, x):
-        # Self-attention with residual connection
-        x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + attn_out
+        # output shape: [batch, 1, hidden_size]
+        pred = self.fc(output[:, 0, :])   # [batch, 1]
 
-        # Feedforward with residual connection
-        x_norm = self.norm2(x)
-        x = x + self.mlp(x_norm)
+        return pred, hidden, cell
 
-        return x
-
-
-# ------------------------------
-# 10. Vision Transformer
-# ------------------------------
-class VisionTransformer(nn.Module):
-    def __init__(
-        self,
-        img_size=128,
-        patch_size=16,
-        in_channels=3,
-        num_classes=38,
-        embed_dim=128,
-        depth=4,
-        num_heads=4,
-        mlp_dim=256,
-        dropout=0.1
-    ):
+# ============================================================
+# 9. SEQ2SEQ MODEL
+#
+# Encoder:
+#   reads past 72 hours
+#
+# Decoder:
+#   predicts 24 future PM2.5 values autoregressively
+#
+# Teacher forcing:
+#   sometimes feed the true previous target
+#   sometimes feed the model's own previous prediction
+# ============================================================
+class Seq2SeqLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, output_seq_len):
         super().__init__()
+        self.encoder = Encoder(input_size, hidden_size)
+        self.decoder = Decoder(hidden_size, output_size=1)
+        self.output_seq_len = output_seq_len
 
-        self.patch_embed = PatchEmbedding(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_channels=in_channels,
-            embed_dim=embed_dim
-        )
-
-        num_patches = self.patch_embed.num_patches
-
-        # Learnable class token
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-
-        # Learnable positional embeddings for class token + all patches
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-
-        self.dropout = nn.Dropout(dropout)
-
-        self.encoder_layers = nn.ModuleList([
-            TransformerEncoderBlock(embed_dim, num_heads, mlp_dim, dropout)
-            for _ in range(depth)
-        ])
-
-        self.norm = nn.LayerNorm(embed_dim)
-
-        self.head = nn.Linear(embed_dim, num_classes)
-
-    def forward(self, x):
+    def forward(self, src, target=None, teacher_forcing_ratio=0.0):
         """
-        x: (B, 3, 128, 128)
+        src    : [batch, 72, input_size]
+        target : [batch, 24] or None
         """
-        B = x.shape[0]
+        batch_size = src.size(0)
 
-        # Patch embeddings -> (B, 64, embed_dim)
-        x = self.patch_embed(x)
+        # Store all decoder predictions
+        outputs = torch.zeros(batch_size, self.output_seq_len, device=src.device)
 
-        # Expand class token for batch
-        cls_tokens = self.cls_token.expand(B, -1, -1)   # (B, 1, embed_dim)
+        # Encoder processes past 72-hour input
+        hidden, cell = self.encoder(src)
 
-        # Concatenate class token at front
-        x = torch.cat((cls_tokens, x), dim=1)           # (B, 65, embed_dim)
+        # First decoder input:
+        # use the last PM2.5 value from the input sequence
+        decoder_input = src[:, -1, target_col_index].unsqueeze(1).unsqueeze(2)  # [batch, 1, 1]
 
-        # Add positional embeddings
-        x = x + self.pos_embed
-        x = self.dropout(x)
+        for t in range(self.output_seq_len):
+            pred, hidden, cell = self.decoder(decoder_input, hidden, cell)
+            outputs[:, t] = pred.squeeze(1)
 
-        # Transformer encoder
-        for layer in self.encoder_layers:
-            x = layer(x)
+            # Decide whether to use teacher forcing
+            if target is not None and np.random.rand() < teacher_forcing_ratio:
+                next_input = target[:, t].unsqueeze(1).unsqueeze(2)  # true value
+            else:
+                next_input = pred.unsqueeze(1)  # model prediction, shape [batch, 1, 1]
 
-        x = self.norm(x)
+            decoder_input = next_input
 
-        # Use class token output
-        cls_output = x[:, 0]                            # (B, embed_dim)
-        logits = self.head(cls_output)                  # (B, num_classes)
+        return outputs
 
-        return logits
-
-
-# ------------------------------
-# 11. Simple CNN for parameter comparison
-# ------------------------------
-class SimpleCNN(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),   # 128 -> 64
-
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),   # 64 -> 32
-
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),   # 32 -> 16
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 16 * 16, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
-
-
-# ------------------------------
-# 12. Helper: parameter count
-# ------------------------------
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-# ------------------------------
-# 13. Build models
-# ------------------------------
-vit_model = VisionTransformer(
-    img_size=128,
-    patch_size=16,
-    in_channels=3,
-    num_classes=num_classes,
-    embed_dim=128,
-    depth=4,
-    num_heads=4,
-    mlp_dim=256,
-    dropout=0.1
-).to(device)
-
-cnn_model = SimpleCNN(num_classes=num_classes).to(device)
-
-print("\nParameter counts:")
-print("ViT parameters :", count_parameters(vit_model))
-print("CNN parameters :", count_parameters(cnn_model))
-
-
-# ------------------------------
-# 14. Training utilities
-# ------------------------------
-def run_epoch(model, loader, criterion, optimizer=None):
-    is_train = optimizer is not None
-    model.train() if is_train else model.eval()
-
+# ============================================================
+# 10. HELPER FUNCTIONS
+# ============================================================
+def train_one_epoch(model, loader, criterion, optimizer, device, teacher_forcing_ratio):
+    model.train()
     total_loss = 0.0
-    total_correct = 0
     total_samples = 0
 
-    for xb, yb in loader:
-        xb = xb.to(device)
-        yb = yb.to(device)
+    for x_batch, y_batch in loader:
+        x_batch = x_batch.to(device)
+        y_batch = y_batch.to(device)
 
-        if is_train:
-            optimizer.zero_grad()
+        optimizer.zero_grad()
 
-        with torch.set_grad_enabled(is_train):
-            logits = model(xb)
-            loss = criterion(logits, yb)
+        preds = model(x_batch, target=y_batch, teacher_forcing_ratio=teacher_forcing_ratio)
+        loss = criterion(preds, y_batch)
 
-            if is_train:
-                loss.backward()
-                optimizer.step()
+        loss.backward()
+        optimizer.step()
 
-        total_loss += loss.item() * xb.size(0)
-        preds = torch.argmax(logits, dim=1)
-        total_correct += (preds == yb).sum().item()
-        total_samples += xb.size(0)
+        batch_size = x_batch.size(0)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
 
-    avg_loss = total_loss / total_samples
-    acc = total_correct / total_samples
-
-    return avg_loss, acc
+    return total_loss / total_samples
 
 
-def train_model(model, train_loader, val_loader, epochs=10, lr=1e-3):
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
 
-    train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
+    with torch.no_grad():
+        for x_batch, y_batch in loader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
 
-    best_val_acc = 0.0
-    best_state = copy.deepcopy(model.state_dict())
+            preds = model(x_batch, target=None, teacher_forcing_ratio=0.0)
+            loss = criterion(preds, y_batch)
 
-    for epoch in range(epochs):
-        train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer=optimizer)
-        val_loss, val_acc = run_epoch(model, val_loader, criterion, optimizer=None)
+            batch_size = x_batch.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_accs.append(train_acc)
-        val_accs.append(val_acc)
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_state = copy.deepcopy(model.state_dict())
-
-        print(
-            f"Epoch {epoch+1:02d}/{epochs} | "
-            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
-        )
-
-    model.load_state_dict(best_state)
-    return model, train_losses, val_losses, train_accs, val_accs
+    return total_loss / total_samples
 
 
-def evaluate_test(model, test_loader):
-    criterion = nn.CrossEntropyLoss()
-    test_loss, test_acc = run_epoch(model, test_loader, criterion, optimizer=None)
-    return test_loss, test_acc
+def inverse_transform_target(seq_scaled, mean, std):
+    return seq_scaled * std + mean
 
+# ============================================================
+# 11. BUILD MODEL
+# ============================================================
+model = Seq2SeqLSTM(
+    input_size=input_size,
+    hidden_size=HIDDEN_SIZE,
+    output_seq_len=OUTPUT_SEQ_LEN
+).to(device)
 
-# ------------------------------
-# 15. Train the ViT
-# ------------------------------
-print("\nTraining Vision Transformer...\n")
-vit_model, vit_train_losses, vit_val_losses, vit_train_accs, vit_val_accs = train_model(
-    vit_model,
-    train_loader,
-    val_loader,
-    epochs=10,
-    lr=1e-3
-)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-vit_test_loss, vit_test_acc = evaluate_test(vit_model, test_loader)
+# ============================================================
+# 12. TRAINING LOOP
+# ============================================================
+train_losses = []
+val_losses = []
+epoch_times = []
 
-print("\nViT Test Loss:", vit_test_loss)
-print("ViT Test Accuracy:", vit_test_acc)
+print("\nTraining Seq2Seq LSTM...")
 
+for epoch in range(1, NUM_EPOCHS + 1):
+    start_time = time.time()
 
-# ------------------------------
-# 16. Plot training curves
-# ------------------------------
+    train_loss = train_one_epoch(
+        model,
+        train_loader,
+        criterion,
+        optimizer,
+        device,
+        teacher_forcing_ratio=TEACHER_FORCING_RATIO
+    )
+
+    val_loss = evaluate(model, val_loader, criterion, device)
+
+    end_time = time.time()
+    epoch_time = end_time - start_time
+
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    epoch_times.append(epoch_time)
+
+    print(
+        f"Epoch {epoch:02d}/{NUM_EPOCHS} | "
+        f"Train MSE: {train_loss:.6f} | "
+        f"Val MSE: {val_loss:.6f} | "
+        f"Time: {epoch_time:.2f} sec"
+    )
+
+# ============================================================
+# 13. TEST SET EVALUATION
+# ============================================================
+test_loss = evaluate(model, test_loader, criterion, device)
+
+print("\nFinal Validation MSE:", val_losses[-1])
+print("Test MSE:", test_loss)
+
+# ============================================================
+# 14. PLOT TRAIN / VAL LOSS
+# ============================================================
+epochs = np.arange(1, NUM_EPOCHS + 1)
+
 plt.figure(figsize=(8, 5))
-plt.plot(vit_train_losses, label="Train Loss")
-plt.plot(vit_val_losses, label="Validation Loss")
+plt.plot(epochs, train_losses, marker='o', label="Train MSE")
+plt.plot(epochs, val_losses, marker='o', label="Validation MSE")
 plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.title("ViT Loss Curves")
+plt.ylabel("MSE")
+plt.title("Seq2Seq LSTM Training")
 plt.legend()
-plt.grid(True)
-plt.show()
+plt.tight_layout()
+plt.savefig('lstm-jpeg')
 
-plt.figure(figsize=(8, 5))
-plt.plot(vit_train_accs, label="Train Accuracy")
-plt.plot(vit_val_accs, label="Validation Accuracy")
-plt.xlabel("Epoch")
-plt.ylabel("Accuracy")
-plt.title("ViT Accuracy Curves")
-plt.legend()
-plt.grid(True)
-plt.show()
+# ============================================================
+# 15. PLOT ONE TEST EXAMPLE
+#
+# We take one example from test set, predict the next 24 hours,
+# and compare predicted vs true PM2.5 sequence.
+# ============================================================
+model.eval()
 
-
-# ------------------------------
-# 17. Show patchifying on one image
-# ------------------------------
-sample_img, sample_label = full_dataset[0]
-sample_img_batch = sample_img.unsqueeze(0).to(device)
-
-patch_embed = PatchEmbedding(img_size=128, patch_size=16, in_channels=3, embed_dim=128).to(device)
+x_example, y_true = test_dataset[0]
+x_example = x_example.unsqueeze(0).to(device)  # [1, 72, input_size]
 
 with torch.no_grad():
-    patch_tokens = patch_embed(sample_img_batch)
+    y_pred = model(x_example, target=None, teacher_forcing_ratio=0.0)
 
-print("\nOne image shape:", sample_img.shape)           # (3, 128, 128)
-print("Patch token shape:", patch_tokens.shape)        # (1, 64, 128)
-print("Number of patches:", patch_embed.num_patches)
-print("Patch flattened dimension:", patch_embed.patch_dim)
+# Convert to numpy
+y_true = y_true.cpu().numpy()              # [24]
+y_pred = y_pred.squeeze(0).cpu().numpy()  # [24]
 
+# Convert back to original PM2.5 units
+y_true_original = inverse_transform_target(y_true, target_mean, target_std)
+y_pred_original = inverse_transform_target(y_pred, target_mean, target_std)
 
-# ------------------------------
-# 18. Print final parameter comparison
-# ------------------------------
-vit_params = count_parameters(vit_model)
-cnn_params = count_parameters(cnn_model)
+future_hours = np.arange(1, OUTPUT_SEQ_LEN + 1)
 
-print("\n========== PARAMETER EFFICIENCY ==========")
-print("ViT Parameters:", vit_params)
-print("CNN Parameters:", cnn_params)
+plt.figure(figsize=(10, 5))
+plt.plot(future_hours, y_true_original, marker='o', label="True PM2.5")
+plt.plot(future_hours, y_pred_original, marker='o', label="Predicted PM2.5")
+plt.xlabel("Future hour")
+plt.ylabel("PM2.5")
+plt.title("24-hour Forecast: True vs Predicted")
+plt.legend()
+plt.tight_layout()
+plt.savefig('true-pred.jpeg')
 
-if vit_params < cnn_params:
-    print("ViT is more parameter-efficient than the CNN.")
-else:
-    print("CNN is more parameter-efficient than the ViT.")
+# ============================================================
+# 16. OPTIONAL: PRINT PREDICTION ARRAYS
+# ============================================================
+print("\nTrue 24-hour PM2.5 sequence:")
+print(y_true_original)
+
+print("\nPredicted 24-hour PM2.5 sequence:")
+print(y_pred_original)
