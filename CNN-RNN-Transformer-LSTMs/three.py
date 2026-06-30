@@ -1,4 +1,3 @@
-import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -7,61 +6,88 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# ============================================================
-# 1. REPRODUCIBILITY + DEVICE
-# ============================================================
-torch.manual_seed(42)
-np.random.seed(42)
+from sklearn.preprocessing import StandardScaler
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
 
-# ============================================================
-# 2. USER SETTINGS
-# ============================================================
-CSV_PATH = "/Users/vaishnavisharma/prnn/delhi_aqi.csv"   
-TARGET_COL = "pm2_5"
-
-INPUT_SEQ_LEN = 72     # past 72 hours
-OUTPUT_SEQ_LEN = 24    # next 24 hours
-
+# =========================================================
+# 1. CONFIG
+SEQ_LEN = 72
 BATCH_SIZE = 64
-HIDDEN_SIZE = 64
-NUM_EPOCHS = 100
-LEARNING_RATE = 1e-3
-TEACHER_FORCING_RATIO = 0.5
+HIDDEN_DIM = 64
+LR = 1e-3
+EPOCHS = 100
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ============================================================
-# 3. LOAD DATA
-# ============================================================
-df = pd.read_csv(CSV_PATH)
+print("Using device:", DEVICE)
 
-# Clean column names
-df.columns = [c.strip().lower() for c in df.columns]
-TARGET_COL = TARGET_COL.lower()
 
-if TARGET_COL not in df.columns:
-    raise ValueError(f"Target column '{TARGET_COL}' not found.\nColumns: {df.columns.tolist()}")
+# =========================================================
+# 2. LOAD DATA
+# =========================================================
+df = pd.read_csv('/Users/vaishnavisharma/prnn/delhi_aqi.csv')
 
-# Use only numeric columns
-numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+print("Columns in dataset:")
+print(df.columns.tolist())
+print("\nFirst 5 rows:")
+print(df.head())
 
-if TARGET_COL not in numeric_cols:
-    raise ValueError(f"Target column '{TARGET_COL}' is not numeric.")
 
-feature_cols = numeric_cols.copy()
+# =========================================================
+# 3. FIND TIME COLUMN
+# =========================================================
+possible_time_cols = ["date"]
 
-# Drop rows with missing values
-df = df[feature_cols].dropna().reset_index(drop=True)
+time_col = None
+for col in possible_time_cols:
+    if col in df.columns:
+        time_col = col
+        break
 
-print("Using features:")
-print(feature_cols)
-print("Number of rows after cleanup:", len(df))
+if time_col is None:
+    raise ValueError(
+        "Time column not found automatically. Please set time_col manually."
+    )
 
-# ============================================================
-# 4. CHRONOLOGICAL SPLIT: 70 / 15 / 15
-# ============================================================
+print("\nUsing time column:", time_col)
+
+df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+df = df.dropna(subset=[time_col])
+df = df.sort_values(time_col).reset_index(drop=True)
+
+
+# =========================================================
+# 4. SELECT FEATURES
+# =========================================================
+# Adjust this list based on your dataset columns
+candidate_features = ['co', 'no', 'no2', 'o3', 'so2', 'pm2_5', 'pm10', 'nh3']
+
+available_features = [col for col in candidate_features if col in df.columns]
+
+if "pm2_5" not in available_features:
+    raise ValueError("PM2.5 column is required in the dataset.")
+
+
+print("\nUsing features:")
+print(available_features)
+
+df = df[[time_col] + available_features].copy()
+
+
+# =========================================================
+# 5. HANDLE MISSING VALUES
+# =========================================================
+df[available_features] = df[available_features].replace([np.inf, -np.inf], np.nan)
+df[available_features] = df[available_features].ffill().bfill()
+df = df.dropna(subset=available_features).reset_index(drop=True)
+
+print("\nRows after cleaning:", len(df))
+
+
+# =========================================================
+# 6. CHRONOLOGICAL 70 / 15 / 15 SPLIT
+# =========================================================
 n_total = len(df)
+
 n_train = int(0.70 * n_total)
 n_val = int(0.15 * n_total)
 n_test = n_total - n_train - n_val
@@ -75,333 +101,221 @@ print("Train:", len(train_df))
 print("Val  :", len(val_df))
 print("Test :", len(test_df))
 
-# ============================================================
-# 5. STANDARDIZE USING TRAIN ONLY
-# ============================================================
-train_mean = train_df.mean()
-train_std = train_df.std().replace(0, 1.0)
 
-train_scaled = (train_df - train_mean) / train_std
-val_scaled = (val_df - train_mean) / train_std
-test_scaled = (test_df - train_mean) / train_std
+# =========================================================
+# 7. SCALE DATA
+# Fit scaler ONLY on train data
+# =========================================================
+train_values = train_df[available_features].values
+val_values = val_df[available_features].values
+test_values = test_df[available_features].values
 
-target_col_index = feature_cols.index(TARGET_COL)
-input_size = len(feature_cols)
+print(df[available_features[5]])
+feature_scaler = StandardScaler()
+train_scaled = feature_scaler.fit_transform(train_values)
+val_scaled = feature_scaler.transform(val_values)
+test_scaled = feature_scaler.transform(test_values)
 
-print("\nTarget column index:", target_col_index)
-print("Input size:", input_size)
+# Separate scaler for PM2.5 target for inverse transform later
+target_scaler = StandardScaler()
+target_scaler.fit(train_df[["pm2_5"]].values)
 
-# We will need these later to convert predictions back to original units
-target_mean = train_mean[TARGET_COL]
-target_std = train_std[TARGET_COL]
 
-# ============================================================
-# 6. DATASET FOR SEQ2SEQ
-#
-# Input:
-#   past 72 hours of all features
-#
-# Target:
-#   next 24 hours of PM2.5 only
-#
-# Example:
-#   x = data[t : t+72]
-#   y = pm2_5[t+72 : t+72+24]
-# ============================================================
-class AirQualitySeq2SeqDataset(Dataset):
-    def __init__(self, scaled_df, input_seq_len, output_seq_len, target_col_index):
-        self.data = scaled_df.values.astype(np.float32)
-        self.input_seq_len = input_seq_len
-        self.output_seq_len = output_seq_len
-        self.target_col_index = target_col_index
+# =========================================================
+# 8. CREATE SEQUENCES
+# Input: previous 72 steps
+# Output: next PM2.5
+# =========================================================
+def create_sequences(data_array, seq_len=72, target_col_idx=5):
+    X, y = [], []
+
+    for i in range(len(data_array) - seq_len):
+        X.append(data_array[i:i + seq_len])
+        y.append(data_array[i + seq_len, target_col_idx])
+
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.float32).reshape(-1, 1)
+    return X, y
+
+
+X_train, y_train = create_sequences(train_scaled, seq_len=SEQ_LEN, target_col_idx=5)
+X_val, y_val = create_sequences(val_scaled, seq_len=SEQ_LEN, target_col_idx=5)
+X_test, y_test = create_sequences(test_scaled, seq_len=SEQ_LEN, target_col_idx=5)
+
+print("\nSequence shapes:")
+print("X_train:", X_train.shape, " y_train:", y_train.shape)
+print("X_val  :", X_val.shape,   " y_val  :", y_val.shape)
+print("X_test :", X_test.shape,  " y_test :", y_test.shape)
+
+
+# =========================================================
+# 9. DATASET CLASS
+# =========================================================
+class AirQualityDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
 
     def __len__(self):
-        return len(self.data) - self.input_seq_len - self.output_seq_len + 1
+        return len(self.X)
 
     def __getitem__(self, idx):
-        x = self.data[idx : idx + self.input_seq_len]  # [72, num_features]
+        return self.X[idx], self.y[idx]
 
-        y = self.data[
-            idx + self.input_seq_len : idx + self.input_seq_len + self.output_seq_len,
-            self.target_col_index
-        ]  # [24]
 
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
-
-train_dataset = AirQualitySeq2SeqDataset(train_scaled, INPUT_SEQ_LEN, OUTPUT_SEQ_LEN, target_col_index)
-val_dataset = AirQualitySeq2SeqDataset(val_scaled, INPUT_SEQ_LEN, OUTPUT_SEQ_LEN, target_col_index)
-test_dataset = AirQualitySeq2SeqDataset(test_scaled, INPUT_SEQ_LEN, OUTPUT_SEQ_LEN, target_col_index)
-
-print("\nDataset lengths:")
-print("Train:", len(train_dataset))
-print("Val  :", len(val_dataset))
-print("Test :", len(test_dataset))
+train_dataset = AirQualityDataset(X_train, y_train)
+val_dataset = AirQualityDataset(X_val, y_val)
+test_dataset = AirQualityDataset(X_test, y_test)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# ============================================================
-# 7. ENCODER
-#
-# The encoder reads the past 72-hour input sequence and
-# compresses it into a final hidden state and cell state.
-# ============================================================
-class Encoder(nn.Module):
-    def __init__(self, input_size, hidden_size):
+
+# =========================================================
+# 10. VANILLA RNN FROM SCRATCH
+# =========================================================
+class VanillaRNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim=1):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, batch_first=True)
+        self.hidden_dim = hidden_dim
+
+        self.Wx = nn.Linear(input_dim, hidden_dim)      # input -> hidden
+        self.Wh = nn.Linear(hidden_dim, hidden_dim)     # hidden -> hidden
+        self.Wy = nn.Linear(hidden_dim, output_dim)     # hidden -> output
 
     def forward(self, x):
-        # x shape: [batch, 72, input_size]
-        outputs, (hidden, cell) = self.lstm(x)
+        # x shape: (batch_size, seq_len, input_dim)
+        batch_size, seq_len, _ = x.shape
 
-        # outputs: [batch, 72, hidden_size]
-        # hidden : [1, batch, hidden_size]
-        # cell   : [1, batch, hidden_size]
-        return hidden, cell
+        h = torch.zeros(batch_size, self.hidden_dim, device=x.device)
 
-# ============================================================
-# 8. DECODER
-#
-# The decoder predicts one future step at a time.
-# Input to decoder at each step:
-#   previous PM2.5 value (scalar)
-#
-# Output:
-#   next PM2.5 value
-# ============================================================
-class Decoder(nn.Module):
-    def __init__(self, hidden_size, output_size=1):
-        super().__init__()
-        self.hidden_size = hidden_size
+        for t in range(seq_len):
+            x_t = x[:, t, :]   # shape: (batch_size, input_dim)
+            h = torch.tanh(self.Wx(x_t) + self.Wh(h))
 
-        # Decoder input at each step is a single PM2.5 value
-        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
+        out = self.Wy(h)       # shape: (batch_size, 1)
+        return out
 
-    def forward(self, x, hidden, cell):
-        # x shape: [batch, 1, 1]
-        output, (hidden, cell) = self.lstm(x, (hidden, cell))
 
-        # output shape: [batch, 1, hidden_size]
-        pred = self.fc(output[:, 0, :])   # [batch, 1]
+input_dim = X_train.shape[2]
+model = VanillaRNN(input_dim=input_dim, hidden_dim=HIDDEN_DIM, output_dim=1).to(DEVICE)
 
-        return pred, hidden, cell
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-# ============================================================
-# 9. SEQ2SEQ MODEL
-#
-# Encoder:
-#   reads past 72 hours
-#
-# Decoder:
-#   predicts 24 future PM2.5 values autoregressively
-#
-# Teacher forcing:
-#   sometimes feed the true previous target
-#   sometimes feed the model's own previous prediction
-# ============================================================
-class Seq2SeqLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, output_seq_len):
-        super().__init__()
-        self.encoder = Encoder(input_size, hidden_size)
-        self.decoder = Decoder(hidden_size, output_size=1)
-        self.output_seq_len = output_seq_len
 
-    def forward(self, src, target=None, teacher_forcing_ratio=0.0):
-        """
-        src    : [batch, 72, input_size]
-        target : [batch, 24] or None
-        """
-        batch_size = src.size(0)
-
-        # Store all decoder predictions
-        outputs = torch.zeros(batch_size, self.output_seq_len, device=src.device)
-
-        # Encoder processes past 72-hour input
-        hidden, cell = self.encoder(src)
-
-        # First decoder input:
-        # use the last PM2.5 value from the input sequence
-        decoder_input = src[:, -1, target_col_index].unsqueeze(1).unsqueeze(2)  # [batch, 1, 1]
-
-        for t in range(self.output_seq_len):
-            pred, hidden, cell = self.decoder(decoder_input, hidden, cell)
-            outputs[:, t] = pred.squeeze(1)
-
-            # Decide whether to use teacher forcing
-            if target is not None and np.random.rand() < teacher_forcing_ratio:
-                next_input = target[:, t].unsqueeze(1).unsqueeze(2)  # true value
-            else:
-                next_input = pred.unsqueeze(1)  # model prediction, shape [batch, 1, 1]
-
-            decoder_input = next_input
-
-        return outputs
-
-# ============================================================
-# 10. HELPER FUNCTIONS
-# ============================================================
-def train_one_epoch(model, loader, criterion, optimizer, device, teacher_forcing_ratio):
+# =========================================================
+# 11. TRAINING AND EVALUATION FUNCTIONS
+# =========================================================
+def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0.0
-    total_samples = 0
 
-    for x_batch, y_batch in loader:
-        x_batch = x_batch.to(device)
+    for X_batch, y_batch in loader:
+        X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
 
         optimizer.zero_grad()
-
-        preds = model(x_batch, target=y_batch, teacher_forcing_ratio=teacher_forcing_ratio)
+        preds = model(X_batch)
         loss = criterion(preds, y_batch)
-
         loss.backward()
         optimizer.step()
 
-        batch_size = x_batch.size(0)
-        total_loss += loss.item() * batch_size
-        total_samples += batch_size
+        total_loss += loss.item() * X_batch.size(0)
 
-    return total_loss / total_samples
+    return total_loss / len(loader.dataset)
 
 
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
-    total_samples = 0
 
     with torch.no_grad():
-        for x_batch, y_batch in loader:
-            x_batch = x_batch.to(device)
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
 
-            preds = model(x_batch, target=None, teacher_forcing_ratio=0.0)
+            preds = model(X_batch)
             loss = criterion(preds, y_batch)
 
-            batch_size = x_batch.size(0)
-            total_loss += loss.item() * batch_size
-            total_samples += batch_size
+            total_loss += loss.item() * X_batch.size(0)
 
-    return total_loss / total_samples
+    return total_loss / len(loader.dataset)
 
 
-def inverse_transform_target(seq_scaled, mean, std):
-    return seq_scaled * std + mean
-
-# ============================================================
-# 11. BUILD MODEL
-# ============================================================
-model = Seq2SeqLSTM(
-    input_size=input_size,
-    hidden_size=HIDDEN_SIZE,
-    output_seq_len=OUTPUT_SEQ_LEN
-).to(device)
-
-criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-# ============================================================
-# 12. TRAINING LOOP
-# ============================================================
+# =========================================================
+# 12. TRAIN MODEL
+# =========================================================
 train_losses = []
 val_losses = []
-epoch_times = []
 
-print("\nTraining Seq2Seq LSTM...")
-
-for epoch in range(1, NUM_EPOCHS + 1):
-    start_time = time.time()
-
-    train_loss = train_one_epoch(
-        model,
-        train_loader,
-        criterion,
-        optimizer,
-        device,
-        teacher_forcing_ratio=TEACHER_FORCING_RATIO
-    )
-
-    val_loss = evaluate(model, val_loader, criterion, device)
-
-    end_time = time.time()
-    epoch_time = end_time - start_time
+for epoch in range(EPOCHS):
+    train_loss = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
+    val_loss = evaluate(model, val_loader, criterion, DEVICE)
 
     train_losses.append(train_loss)
     val_losses.append(val_loss)
-    epoch_times.append(epoch_time)
 
-    print(
-        f"Epoch {epoch:02d}/{NUM_EPOCHS} | "
-        f"Train MSE: {train_loss:.6f} | "
-        f"Val MSE: {val_loss:.6f} | "
-        f"Time: {epoch_time:.2f} sec"
-    )
+    print(f"Epoch [{epoch+1}/{EPOCHS}] | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
-# ============================================================
-# 13. TEST SET EVALUATION
-# ============================================================
-test_loss = evaluate(model, test_loader, criterion, device)
 
-print("\nFinal Validation MSE:", val_losses[-1])
-print("Test MSE:", test_loss)
+# =========================================================
+# 13. TEST EVALUATION
+# =========================================================
+test_loss = evaluate(model, test_loader, criterion, DEVICE)
+print(f"\nTest Loss: {test_loss:.6f}")
 
-# ============================================================
+
+# =========================================================
 # 14. PLOT TRAIN / VAL LOSS
-# ============================================================
-epochs = np.arange(1, NUM_EPOCHS + 1)
-
+# =========================================================
 plt.figure(figsize=(8, 5))
-plt.plot(epochs, train_losses, marker='o', label="Train MSE")
-plt.plot(epochs, val_losses, marker='o', label="Validation MSE")
+plt.plot(train_losses, label="Train Loss")
+plt.plot(val_losses, label="Validation Loss")
 plt.xlabel("Epoch")
-plt.ylabel("MSE")
-plt.title("Seq2Seq LSTM Training")
+plt.ylabel("MSE Loss")
+plt.title("Vanilla RNN Training Loss")
 plt.legend()
-plt.tight_layout()
-plt.savefig('lstm-jpeg')
+plt.grid(True)
+plt.savefig('train-val-rnn.jpeg')
 
-# ============================================================
-# 15. PLOT ONE TEST EXAMPLE
-#
-# We take one example from test set, predict the next 24 hours,
-# and compare predicted vs true PM2.5 sequence.
-# ============================================================
+
+# =========================================================
+# 15. PREDICT ON TEST SET
+# =========================================================
 model.eval()
-
-x_example, y_true = test_dataset[0]
-x_example = x_example.unsqueeze(0).to(device)  # [1, 72, input_size]
+all_preds = []
+all_true = []
 
 with torch.no_grad():
-    y_pred = model(x_example, target=None, teacher_forcing_ratio=0.0)
+    for X_batch, y_batch in test_loader:
+        X_batch = X_batch.to(DEVICE)
+        preds = model(X_batch).cpu().numpy()
 
-# Convert to numpy
-y_true = y_true.cpu().numpy()              # [24]
-y_pred = y_pred.squeeze(0).cpu().numpy()  # [24]
+        all_preds.append(preds)
+        all_true.append(y_batch.numpy())
 
-# Convert back to original PM2.5 units
-y_true_original = inverse_transform_target(y_true, target_mean, target_std)
-y_pred_original = inverse_transform_target(y_pred, target_mean, target_std)
+all_preds = np.vstack(all_preds)
+all_true = np.vstack(all_true)
 
-future_hours = np.arange(1, OUTPUT_SEQ_LEN + 1)
+# Convert back to original PM2.5 scale
+preds_pm25 = target_scaler.inverse_transform(all_preds)
+true_pm25 = target_scaler.inverse_transform(all_true)
 
+
+# =========================================================
+# 16. PLOT TEST PREDICTIONS
+# =========================================================
 plt.figure(figsize=(10, 5))
-plt.plot(future_hours, y_true_original, marker='o', label="True PM2.5")
-plt.plot(future_hours, y_pred_original, marker='o', label="Predicted PM2.5")
-plt.xlabel("Future hour")
+plt.plot(true_pm25[:200], label="True PM2.5")
+plt.plot(preds_pm25[:200], label="Predicted PM2.5")
+plt.xlabel("Time Step")
 plt.ylabel("PM2.5")
-plt.title("24-hour Forecast: True vs Predicted")
+plt.title("True vs Predicted PM2.5 on Test Set")
 plt.legend()
-plt.tight_layout()
-plt.savefig('true-pred.jpeg')
+plt.grid(True)
+plt.savefig('test-rnn.jpeg')
 
-# ============================================================
-# 16. OPTIONAL: PRINT PREDICTION ARRAYS
-# ============================================================
-print("\nTrue 24-hour PM2.5 sequence:")
-print(y_true_original)
 
-print("\nPredicted 24-hour PM2.5 sequence:")
-print(y_pred_original)
+#second part
